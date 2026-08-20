@@ -1,0 +1,8 @@
+# Design docs and working notes stay local — not published.
+*.md
+
+# Local tool state
+.claude/
+
+# macOS
+.DS_Store

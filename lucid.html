@@ -1,0 +1,4137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>Lucid</title>
+<style>
+  /* A deliberately single-theme world. The game paints its own ground on every
+     surface, so it never inherits a host page's light or dark background. */
+  html,body{margin:0;padding:0;height:100%;background:#000;overflow:hidden;
+    -webkit-tap-highlight-color:transparent;touch-action:none;overscroll-behavior:none;}
+  canvas{display:block;position:fixed;inset:0;width:100%;height:100%;cursor:default;background:#000;}
+  body.lucid canvas{cursor:grab}
+  body.dragging canvas{cursor:grabbing}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+/* ===========================================================================
+   LUCID — Level 1: The Ridge
+   A philosophical casual platformer on existential dread and human illusion.
+   Vertical slice: Total Lucidity, the Armor Wheel, The Climb, The Routine.
+   Everything (art, audio, type) is generated at runtime. No assets.
+   =========================================================================== */
+
+/* ---------------------------------------------------------------- utility */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const smooth=t=>t*t*(3-2*t);
+const easeOutCubic=t=>1-Math.pow(1-t,3);
+const easeOutExpo=t=>t>=1?1:1-Math.pow(2,-9*t);
+const easeInCubic=t=>t*t*t;
+const inv=(a,b,v)=>clamp((v-a)/(b-a),0,1);
+
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const RND=mulberry32(20260813);
+function rr(a,b){return a+(b-a)*RND();}
+
+// value noise for ridgelines
+function makeNoise(seed){
+  const r=mulberry32(seed), tab=new Float32Array(512);
+  for(let i=0;i<512;i++) tab[i]=r();
+  return x=>{const i=Math.floor(x),f=x-i,a=tab[i&511],b=tab[(i+1)&511];return lerp(a,b,smooth(f));};
+}
+function fbm(nz,x,oct,lac,gain){let s=0,amp=1,fr=1,norm=0;for(let i=0;i<oct;i++){s+=nz(x*fr)*amp;norm+=amp;amp*=gain;fr*=lac;}return s/norm;}
+
+function hex(h,a){ // '#rrggbb' -> rgba string
+  const n=parseInt(h.slice(1),16);
+  return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`;
+}
+
+/* ------------------------------------------------------------ palette ---- */
+// Level 1 palettes, verbatim from the visual/audio style guide.
+const P={
+  raw:{ slate:'#2B3A41', earth:'#8C7A6B', dusk:'#E29578', sand:'#F4F1DE' },
+  climb:{ void:'#000000', cyan:'#00F0FF', white:'#FFFFFF' },
+  routine:{ dark:'#0A0908', amber:'#FFB703', gold:'#FFD166' }
+};
+
+/* ----------------------------------------------------------- canvas ------ */
+const cv=document.getElementById('c');
+const ctx=cv.getContext('2d');
+const snapCv=document.createElement('canvas');
+const snapCtx=snapCv.getContext('2d');
+let VIEW_H=720, VIEW_W=1280, SCALE=1, DPR=1;
+
+/* The duality made physical: Lucidity sees wide and far (and is overwhelmed by
+   how far), the Armor punches in tight. Zoom is driven by state, not by input. */
+const BASE_H=720, ZOOM_LUCID=1.42, ZOOM_ARMOR=1.0;
+let zoom=ZOOM_LUCID;
+function applyZoom(){
+  VIEW_H=BASE_H*zoom; SCALE=cv.height/VIEW_H; VIEW_W=cv.width/SCALE;
+}
+// UI type/geometry is measured in screen pixels, so it divides zoom back out.
+// World text (decay timers) deliberately does not — it belongs to the world.
+const us=n=>n*zoom;
+
+function resize(){
+  DPR=Math.min(window.devicePixelRatio||1,2);
+  const w=Math.max(320,window.innerWidth), h=Math.max(320,window.innerHeight);
+  cv.width=Math.round(w*DPR); cv.height=Math.round(h*DPR);
+  cv.style.width=w+'px'; cv.style.height=h+'px';
+  snapCv.width=cv.width; snapCv.height=cv.height;
+  // Keep a constant world height in view; width flexes with aspect ratio.
+  applyZoom();
+}
+window.addEventListener('resize',resize);
+window.addEventListener('orientationchange',()=>setTimeout(resize,120));
+resize();
+
+const IS_TOUCH=window.matchMedia('(pointer: coarse)').matches;
+// The tremor is the dread meter, so it stays. What goes is the vestibular part:
+// the whole-screen zoom-rush when a lie breaks.
+const REDUCED=window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+/* -------------------------------------------------------------- fonts ---- */
+const SANS='"Helvetica Neue", Inter, system-ui, -apple-system, "Segoe UI", sans-serif';
+const MONO='ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace';
+const canSpace=('letterSpacing' in ctx);
+function setFont(g,weight,size,fam,space){
+  g.font=`${weight} ${size}px ${fam}`;
+  if(canSpace) g.letterSpacing=space||'0px';
+}
+function clearSpace(g){ if(canSpace) g.letterSpacing='0px'; }
+
+/* =============================================================== LEVELS === */
+/* World coordinates: +x right, +y down. Each level supplies its own ground,
+   its own voids, its own palette and props. Everything downstream reads the
+   active level `L` rather than baked-in constants. */
+
+function makeRidge(seed,amp,base,step,span,rough){
+  const nz=makeNoise(seed), pts=[];
+  for(let x=-2600;x<=span;x+=step){ pts.push([x,base-fbm(nz,x*rough,4,2.1,0.5)*amp]); }
+  return pts;
+}
+
+/* ------------------------------------------------------------ THE WALK ---
+   Level one is mostly a walk. Once the ladder has set you down on the far lip
+   there is a very great deal of ridge and nothing whatever on it: no gap, no
+   wall, no armour worth reaching for, nothing that wants anything from you. It
+   takes something like two and a half minutes at the speed this state moves you
+   at, and the length is the whole of the content. The game has just spent a
+   minute proving it can hold your attention with a scoreboard and a clock. Now
+   it takes both away and asks whether you will stay anyway.
+
+   Nothing in here is generated to be surprising. It rises and falls, the light
+   goes, the flowers run down, and the peak stays exactly as far away as it is. */
+function makeWalk(keys,step,seed,amp,maxSlope){
+  const nz=makeNoise(seed), out=[];
+  const last=keys[keys.length-1][0];
+  let k=0, y=keys[0][1];
+  for(let x=keys[0][0];x<=last;x+=step){
+    while(k<keys.length-2&&x>keys[k+1][0]) k++;
+    const a=keys[k], b=keys[k+1];
+    const want=lerp(a[1],b[1],smooth(clamp((x-a[0])/(b[0]-a[0]),0,1)))
+               +(fbm(nz,x*0.0019,4,2.1,0.5)-0.5)*amp;
+    // never steeper than a person can walk up, or it stops being a walk
+    if(out.length) y+=clamp(want-y,-step*maxSlope,step*maxSlope);
+    out.push([x,Math.round(y)]);
+  }
+  return out;
+}
+const RIDGE_WALK=makeWalk(
+  [[1820,516],[2600,424],[3500,512],[4600,402],[5600,500],[6700,388],
+   [7800,476],[9000,366],[10100,448],[11000,350],[12200,432],[13400,344],
+   [14500,428],[15700,352],[16800,436],[17900,358],[18700,392],[19000,340]],
+  150,707,58,0.26);
+
+const CITY_ROAD=makeWalk(
+  [[-1600,606],[400,600],[1520,598],[3200,592],[4800,598],[6420,590],[7760,584],[8400,580],[9400,578]],
+  160,317,22,0.12);
+/* Eighteen of them down the length of the boulevard, packed a little tighter
+   every time, because a cause that has started clearing things finds more. */
+const CITY_BLOCKS=(()=>{ const r=mulberry32(451), out=[]; let x=1520;
+  for(let i=0;i<18;i++){ out.push(Math.round(x)); x+=lerp(345,205,i/17)*lerp(0.9,1.1,r()); }
+  return out; })();
+
+const LEVELS=[
+/* ------------------------------------------------------------- LEVEL 1 --- */
+{
+  id:1, name:'THE RIDGE', theme:'Individual Finitude',
+  spawn:-120, goalX:20400, goalLabel:'THE FAR PEAK',
+  armors:['climb','routine'],
+  // where the ladder is standing, on the near lip of the chasm, unmentioned
+  coldOpen:{x:540},
+  proto:true,                    // both armours offered, and every illusion costs
+  terrain:[
+    [-1600,668],[-1100,656],[-700,648],[-380,640],[-120,636],[80,644],[270,630],[430,634],[560,624],
+    // the far lip of the first chasm, which is where the blinders come off
+    [1240,570],[1330,556],[1450,546],[1560,534],[1660,528],[1700,524],
+    // ...and then two and a half minutes of ridge
+    ...RIDGE_WALK,
+    // the two gaps at the end of it: the first things since the ladder that
+    // you cannot simply walk across, and wide enough to be read as such
+    [19420,300],[19700,292],
+    [20020,224],[20220,198],[20400,182],[20700,176],[21100,184],[21600,192]
+  ],
+  gaps:[{x0:560,x1:1240},{x0:19000,x1:19420},{x0:19700,x1:20020}],
+  paint:{
+    skyTop:'#101a24', skyMid:'#2B3A41', skyLow:'#6d6b6a', skyDusk:'#E29578', skyFloor:'#F4F1DE',
+    night:'#04070d', ground:'#1b262c', groundNight:'#0a0f15', rim:'#E29578',
+    haze:'#E29578', mote:'#F4F1DE', star:'#F4F1DE'
+  },
+  ridges:[
+    {p:0.10,pts:makeRidge(11,150,470,46,11800,0.0016),c:'#33454e',haze:0.55},
+    {p:0.19,pts:makeRidge(27,205,545,40,11800,0.0021),c:'#2a3941',haze:0.36},
+    {p:0.31,pts:makeRidge(53,255,640,34,11800,0.0027),c:'#212e35',haze:0.20},
+    {p:0.46,pts:makeRidge(91,300,760,28,11800,0.0034),c:'#18232a',haze:0.08}
+  ],
+  // a peak far enough away that walking at it for three minutes barely moves it
+  marker:{x:820,y:250,p:0.025,behind:true,c:'#405560'}, markerFade:[19600,20100],
+  build(){
+    const g=[],f=[],r=[];
+    for(let i=0;i<520;i++){ const x=rr(-1500,545); g.push({x,h:rr(9,26),ph:rr(0,6.283),lean:rr(-0.2,0.2),c:rr(0,1)}); }
+    for(let i=0;i<150;i++){ const x=rr(1255,1690); g.push({x,h:rr(7,19),ph:rr(0,6.283),lean:rr(-0.2,0.2),c:rr(0,1)}); }
+    f.push({x:-260,t:192,max:192,hue:18},{x:-40,t:108,max:108,hue:340},{x:150,t:47,max:47,hue:44},
+           {x:318,t:363,max:363,hue:8},{x:470,t:78,max:78,hue:300},{x:520,t:255,max:255,hue:22},
+           {x:1330,t:141,max:141,hue:16},{x:1480,t:63,max:63,hue:38},{x:1630,t:212,max:212,hue:350});
+    r.push({x:-620,w:44,h:150,kind:'pillar',yrs:806},{x:-540,w:40,h:104,kind:'pillar',yrs:412},
+           {x:210,w:150,h:132,kind:'arch',yrs:1412},{x:-980,w:52,h:186,kind:'pillar',yrs:2107},
+           {x:1420,w:36,h:88,kind:'pillar',yrs:239});
+    /* The walk, dressed. Grass the whole way, because a windswept ridge with
+       nothing growing on it is a diagram. Flowers at intervals with their own
+       clocks running down in real time — some of them will be gone before you
+       reach them. Stone with a longer clock, saying the same thing slower. */
+    for(let i=0;i<3800;i++){ const x=rr(1740,18960);
+      g.push({x,h:rr(7,23),ph:rr(0,6.283),lean:rr(-0.22,0.22),c:rr(0,1)}); }
+    const HUES=[8,16,18,22,38,44,300,340,350];
+    for(let i=0;i<62;i++){ const t=Math.round(rr(14,620));
+      f.push({x:1900+i*274+rr(-100,100),t,max:t,hue:HUES[i%HUES.length]}); }
+    for(let i=0;i<22;i++){ const arch=(i%3===0), w=arch?rr(120,178):rr(34,58);
+      r.push({x:2050+i*770+rr(-230,230),w,h:arch?w*rr(0.72,1.0):w*rr(2.0,3.6),
+              kind:arch?'arch':'pillar',yrs:Math.round(rr(160,3600))}); }
+    return {grass:g,flowers:f,ruins:r,crowd:[],statues:[]};
+  }
+},
+
+/* ------------------------------------------------------------- LEVEL 2 --- */
+/* The Noise of Others. An overgrown metropolis: a boulevard barricaded end to
+   end, which only The Dogma can go down, and then an open causeway with nothing
+   in the way at all, which only The Refuge can cross. */
+{
+  id:2, name:'THE NOISE OF OTHERS', theme:'Collective Illusion',
+  spawn:-260, goalX:8400, goalLabel:'THE CITY GATE',
+  armors:['dogma','refuge'],
+  terrain:CITY_ROAD,
+  gaps:[],
+  // A long open causeway. The ground is fine. Being on it alone is not.
+  exposed:{x0:6480,x1:7760},
+  rubble:CITY_BLOCKS,              // the boulevard, barricaded end to end
+  paint:{
+    skyTop:'#0d1116', skyMid:'#1A1E24', skyLow:'#54606a', skyDusk:'#8b98a0', skyFloor:'#CBD5E1',
+    night:'#05070a', ground:'#161b21', groundNight:'#080b0f', rim:'#A3B18A',
+    haze:'#CBD5E1', mote:'#A3B18A', star:'#CBD5E1'
+  },
+  ridges:[
+    {p:0.09,pts:makeRidge(211,120,430,44,6400,0.0014),c:'#252d35',haze:0.50},
+    {p:0.17,pts:makeRidge(233,170,520,38,6400,0.0019),c:'#1e262d',haze:0.34},
+    {p:0.29,pts:makeRidge(257,220,620,32,6400,0.0025),c:'#182027',haze:0.18},
+    {p:0.44,pts:makeRidge(281,270,740,26,6400,0.0032),c:'#121920',haze:0.07}
+  ],
+  marker:{x:1080,y:300,p:0.05,behind:true,c:'#2f3944'}, markerFade:[7900,8300],
+  build(){
+    const towers=[], crowd=[], ivy=[];
+    // the skyline, each block counting down to its own collapse
+    const seedX=[];
+    for(let x=-1420;x<9000;x+=rr(210,330)) seedX.push(Math.round(x));
+    seedX.forEach((x,i)=>towers.push({
+      x, w:rr(70,150), h:rr(150,430), yrs:Math.round(rr(48,940)),
+      tag:'TOWER '+String.fromCharCode(65+(i%12)), win:rr(0,1)
+    }));
+    // ghosts, each sealed inside its own head, passing without seeing
+    for(let i=0;i<150;i++) crowd.push({
+      x:rr(-1500,9200), sp:rr(9,26)*(RND()<0.5?-1:1), h:rr(24,38),
+      ph:rr(0,6.283), a:rr(0.05,0.16)
+    });
+    for(let i=0;i<620;i++) ivy.push({x:rr(-1500,9200),h:rr(10,34),ph:rr(0,6.283),lean:rr(-0.3,0.3),c:rr(0,1)});
+    return {grass:ivy,flowers:[],ruins:[],crowd,statues:[],towers};
+  }
+},
+
+/* ------------------------------------------------------------- LEVEL 3 --- */
+/* The Marble Vault. Halls of monuments suspended in nothing. The Creation
+   draws its own ground until the paint runs out; The Archive computes a way
+   across until it meets a question arithmetic cannot answer. */
+{
+  id:3, name:'THE MARBLE VAULT', theme:'Cultural Legacy',
+  spawn:-240, goalX:5400, goalLabel:'THE EDGE OF THE VAULT',
+  armors:['creation','archive'],
+  terrain:[
+    [-1600,560],[-1100,560],[-700,558],[-240,558],[120,558],[520,556],[820,556],
+    // the far side of the first hall is higher than the near one, and the only
+    // way up to it is a line you draw yourself
+    [1860,452],[2050,448],[2300,446],
+    // and the second hall is simply very wide
+    [5100,352],[5250,346],[5400,342],[5700,340],[6300,346]
+  ],
+  gaps:[{x0:820,x1:1860},{x0:2300,x1:5100}],
+  paint:{
+    skyTop:'#07070b', skyMid:'#0D0D11', skyLow:'#2b2937', skyDusk:'#4A4E69', skyFloor:'#9A8C98',
+    night:'#050509', ground:'#191823', groundNight:'#0b0b12', rim:'#F2E9E4',
+    haze:'#9A8C98', mote:'#F2E9E4', star:'#F2E9E4'
+  },
+  ridges:[
+    {p:0.10,pts:makeRidge(311,60,470,50,7200,0.0011),c:'#1b1a26',haze:0.30},
+    {p:0.20,pts:makeRidge(337,80,560,44,7200,0.0016),c:'#16151f',haze:0.18},
+    {p:0.34,pts:makeRidge(367,100,660,38,7200,0.0022),c:'#111019',haze:0.08}
+  ],
+  marker:{x:900,y:250,p:0.04,behind:true,c:'#2a2836'}, markerFade:[4900,5300],
+  build(){
+    const statues=[], pedestals=[];
+    const at=[-1120,-820,-520,-160,220,560,1900,2090,2260,5140,5250,5360,5560,5900];
+    at.forEach((x,i)=>statues.push({
+      x, h:rr(120,230), w:rr(34,58), yrs:Math.round(rr(60,1400)),
+      tag:['KING','HERO','SAINT','POET','GENERAL','FOUNDER'][i%6], lean:rr(-0.04,0.04)
+    }));
+    for(let i=0;i<70;i++) pedestals.push({x:rr(-1500,6200),w:rr(26,60),h:rr(14,44)});
+    return {grass:[],flowers:[],ruins:[],crowd:[],statues,pedestals};
+  }
+},
+
+/* ------------------------------------------------------------- LEVEL 4 --- */
+/* The Great Silence. One flat mirror of water and an endless sky, and nothing
+   in it that is trying to kill you. No armors: the wheel is spent. The only
+   thing left to learn is how to move without fighting the world. */
+{
+  id:4, name:'THE GREAT SILENCE', theme:'Authenticity',
+  spawn:-300, goalX:3060, goalLabel:'THE LIGHT ON THE WATER',
+  armors:[],                    // every project of meaning has already been spent
+  shore:true, water:560, monoX:1520,
+  terrain:[[-2600,560],[3800,560]],
+  gaps:[],
+  paint:{
+    skyTop:'#03040a', skyMid:'#0a1024', skyLow:'#16224a', skyDusk:'#3b5a8f', skyFloor:'#9FBBD8',
+    night:'#03040a', ground:'#070c1a', groundNight:'#04060e', rim:'#CFE3F5',
+    haze:'#9FBBD8', mote:'#E8F1FA', star:'#F2F7FF'
+  },
+  ridges:[],                    // no walls, no far peaks. Only the horizon.
+  marker:null,
+  build(){
+    // The mirror is the whole level, so the props are what disturbs it: rings
+    // spreading out from where you last put your weight down.
+    return {grass:[],flowers:[],ruins:[],crowd:[],statues:[],ripples:[]};
+  }
+}
+];
+
+let L=LEVELS[0], PROPS=null, REGIONS=[];
+
+// The ridge is long enough now that walking the point list per lookup shows up
+// in the frame time. The points are sorted, so bisect them.
+function terrainAt(x){
+  const T=L.terrain, n=T.length;
+  if(x<=T[0][0]) return T[0][1];
+  if(x>=T[n-1][0]) return T[n-1][1];
+  let lo=0,hi=n-1;
+  while(hi-lo>1){ const m=(lo+hi)>>1; if(T[m][0]<=x) lo=m; else hi=m; }
+  const a=T[lo],b=T[hi];
+  return lerp(a[1],b[1],(x-a[0])/(b[0]-a[0]));
+}
+function terrainY(x){
+  for(const g of L.gaps) if(x>g.x0&&x<g.x1) return null;
+  return terrainAt(x);
+}
+function terrainYSafe(x){
+  const y=terrainY(x);
+  if(y!==null) return y;
+  for(const g of L.gaps) if(x>g.x0&&x<g.x1){
+    const a=terrainYRaw(g.x0), b=terrainYRaw(g.x1);
+    return lerp(a,b,inv(g.x0,g.x1,x));
+  }
+  return 600;
+}
+function terrainYRaw(x){ return terrainAt(x); }
+// Ground you could actually stand on: solid, and not a sheer face.
+function standable(x){
+  const y=terrainY(x); if(y===null) return false;
+  const y2=terrainY(x+8); if(y2===null) return true;
+  return Math.abs((y2-y)/8)<0.42;
+}
+
+/* Walkable runs, derived rather than hand-listed, so any level works. A run is
+   bounded by a void, by ground too steep to climb, or by a standing blockade. */
+function computeRegions(){
+  const T=L.terrain, x0=T[0][0], x1=T[T.length-1][0], STEP=6;
+  const out=[]; let cur=null;
+  for(let x=x0;x<=x1;x+=STEP){
+    let ok=standable(x);
+    if(ok&&L.rubble) for(const b of L.rubble){ if(!S.cleared.has(b)&&Math.abs(x-b)<26){ ok=false; break; } }
+    if(ok){ if(!cur) cur=[x,x]; else cur[1]=x; }
+    else if(cur){ out.push(cur); cur=null; }
+  }
+  if(cur) out.push(cur);
+  REGIONS=out.filter(r=>r[1]-r[0]>40);
+}
+function regionAt(x){
+  for(const r of REGIONS) if(x>=r[0]-40&&x<=r[1]+40) return r;
+  let best=REGIONS[0], bd=1e9;
+  for(const r of REGIONS){ const d=Math.min(Math.abs(x-r[0]),Math.abs(x-r[1])); if(d<bd){bd=d;best=r;} }
+  return best||[x-10,x+10];
+}
+
+const stars=[], clouds=[], motes=[];
+for(let i=0;i<230;i++) stars.push({x:rr(-200,2400),y:rr(-40,420),r:rr(0.4,1.5),tw:rr(0,6.283)});
+for(let i=0;i<11;i++) clouds.push({x:rr(-1200,3200),y:rr(60,330),w:rr(240,680),h:rr(26,64),a:rr(0.05,0.16),v:rr(2,7)});
+for(let i=0;i<130;i++) motes.push({x:rr(-1600,3400),y:rr(-160,700),z:rr(0.25,1),s:rr(0.8,2.4),ph:rr(0,6.283)});
+
+/* =============================================================== ARMORS === */
+/* A project of meaning is not a place on the map. It is built from wherever you
+   happen to be standing when you commit to it, and it spends a fixed number of
+   moves you were never told the count of.
+
+   The two states divide the work between them: the raw world is where you can
+   see the ridge, the chasm and the peak, and therefore where the thinking has
+   to happen. The armour is where you act — fast, precise, and blind to
+   everything you did not look at first. */
+const GRAV=2400, RUN=340, JUMP_V=-840;      // a jump that clears about 230 units
+const COYOTE=0.10, BUFFER=0.13;             // forgiveness, so misses are the player's
+const PLAT_W=118, PLAT_H=14;
+const CLIMB_LAND=44;                        // close enough to the ground to be standing on it
+const ARMOR_TIME=50;                        // fifty seconds, and about fifty things to do in them
+const CLIMB_TIME=40;                        // the ladder runs on a shorter one, and shows it
+/* A ladder is not a landscape. It is a narrow shaft with a great many storeys
+   in it, three places to stand on each, and no way to make progress that is not
+   straight up. Nothing here can be walked around. */
+const CLIMB_ROWS=18, CLIMB_PER_ROW=3, ROW_H=112, SHAFT_W=560;
+/* Nobody has to be told what a cut line is. It starts below the rung you are
+   standing on and comes up at a fixed rate that arrives at the top at very
+   nearly the moment the clock does, so the number in the corner and the dark
+   rising under your feet are one fact told twice. It is why you cannot stand
+   still on a ladder, and it is the only thing in here that is honest. */
+const CUT_LEAD=150, CUT_HEAD=ROW_H*3.0;
+const CUT_GRACE=6;                          // it holds while you find the controls
+const CUT_RATE=53;                          // and then comes up at this, forever
+
+/* The armour does not take you anywhere else. It takes the next impassable
+   thing in front of you and redraws it as a game with an answer: a ladder of
+   rungs, eighteen storeys of them, switching back on itself the way a career
+   does. The ground it covers is one gap. The climbing is years.
+
+   And if the next impassable thing is a very long way off — as it is for most
+   of the ridge — it covers what one of these covers and no further. You can put
+   one on anywhere and cross the whole level inside it, at about the speed you
+   would have walked, seeing none of it. Nothing stops you. */
+const ARMOR_REACH=1200;
+function nextObstacle(x0){
+  const edge=regionAt(x0)[1];
+  let exit=null;
+  for(let x=edge+8;x<edge+3200;x+=8){
+    if(terrainY(x)!==null&&standable(x)){ exit=x; break; }
+  }
+  return {edge,exit};
+}
+function buildClimbCourse(x0,y0,assist){
+  assist=assist||0;
+  const {edge,exit}=nextObstacle(x0);
+  const gx=Math.min(exit===null?edge+900:exit+46,x0+ARMOR_REACH), gy=terrainYSafe(gx);
+  // seeded off where you committed, so the same place always gives the same
+  // ladder, and no two places give the same one
+  const r=mulberry32(Math.round(x0*7.13)+911);
+  const out=[{x:x0,y:y0,w:PLAT_W*1.3,row:0,anchor:true}];
+  // Every time it drops you, the ladder puts out another rung. It is not being
+  // kind. A project that let you fall all the way out of it would stop being a
+  // project, and this one has no intention of losing you.
+  const per=CLIMB_PER_ROW+Math.min(2,Math.floor(assist/2));
+  const wide=1+Math.min(0.40,assist*0.09);
+  // the shaft does not get wider when it gets busier; the rungs just crowd in
+  const gapx=SHAFT_W/per;
+  // A ground floor, so that missing a rung costs you storeys rather than
+  // everything. There is only one way to lose in here and it comes from below.
+  for(let i=0;i<per;i++) out.push({x:x0+(i+0.6)*gapx,y:y0,w:gapx+10,row:0,ground:true});
+  for(let row=1;row<=CLIMB_ROWS;row++){
+    // every storey is offset half a stride from the one below it, so there is
+    // always something one jump overhead and never anything level with you
+    const off=(row%2)*gapx*0.5;
+    /* Two places where a ladder narrows. The middle of it, where most of
+       everybody stops — two rungs, both of them swinging, and the only way past
+       is to stand still and wait for one of them to come to you. And the last
+       storey before the thing you were promised, where they get thin. */
+    const pinch=(row===6||row===13);
+    const n=pinch?Math.min(per,2+Math.floor(assist/2)):per;
+    const stride=pinch?SHAFT_W/n:gapx;
+    for(let i=0;i<n;i++){
+      // and they get smaller the higher you go, because they do
+      const taper=lerp(0.62,0.33,(row-1)/(CLIMB_ROWS-1));
+      const p={x:x0+(pinch?0:off)+(i+0.25)*stride+(r()-0.5)*14,
+               y:y0-row*ROW_H+(r()-0.5)*12,
+               w:PLAT_W*taper*lerp(0.88,1.12,r())*wide,row};
+      // an opening that is only there sometimes is still, technically, an opening
+      if(pinch){ p.drift=rr(58,80); p.dsp=rr(0.5,0.8); p.dph=i*2.4; }
+      else if(row>=4&&r()<0.26-assist*0.035){
+        p.drift=rr(22,40); p.dsp=rr(0.55,1.05); p.dph=r()*6.283;
+      }
+      out.push(p);
+    }
+  }
+  // and the way out sits directly over the last storey
+  const top=out[out.length-1];
+  out.push({x:top.x,y:top.y-ROW_H,w:PLAT_W*1.5,row:CLIMB_ROWS+1,exit:true});
+  out.goal={x:gx,y:gy};
+  out.cx=x0+SHAFT_W*0.5;                    // the shaft holds still; you go up it
+  // the very first one waits longer, because the very first one is also where
+  // you are working out that the arrow keys do anything at all
+  out.grace=CUT_GRACE+(assist===0?5:0);
+  out.floor0=y0+CUT_LEAD;                   // where the cut line starts, just under you
+  out.floorTo=top.y-ROW_H+CUT_HEAD;         // and where it has got to when the clock does
+  out.floor=out.floor0;                     // below this there is no more ladder
+  return out;
+}
+function courseTime(assist){ return Math.min(66,CLIMB_TIME+(assist||0)*6); }
+/* Where the cut line has got to. It waits, and then it comes up at one steady
+   rate and never stops, so that the extra seconds a failed attempt buys you are
+   really extra rather than the same climb stretched out. */
+function climbFloor(){
+  const C=S.course;
+  if(!C||C.floor0===undefined) return 1e9;
+  // it waits under the first rung long enough for you to work out the controls,
+  // and then it starts, and then it does not stop
+  const el=S.armTMax-S.armT, gr=C.grace===undefined?CUT_GRACE:C.grace;
+  return Math.max(C.floorTo,C.floor0-CUT_RATE*Math.max(0,el-gr));
+}
+/* A rung that drifts is at platX(p), not at p.x. Everything that touches one
+   — landing on it, drawing it, being carried by it — has to ask. */
+function platX(p){ return p.drift?p.x+Math.sin(S.t*p.dsp+p.dph)*p.drift:p.x; }
+
+/* The clock running out is not a scripted dead end. It is you, still out over
+   the drop, with the thing that was holding you up no longer holding. */
+function armorFails(){
+  if(S.transition||S.mode!=='armored') return;
+  // In the opening, failing is not a way out. See openingTear.
+  if(S.opening==='ladder'){ openingTear(); return; }
+  S.ceilingFlash=1; say('wall',ARMORS[S.armor].key); vibrate([12,60,12]);
+  shatter(false);
+}
+/* And arriving is the opposite: it sets you down on the real ledge, at very
+   nearly the altitude you started from, however many storeys you climbed. */
+function armorArrives(goal){
+  if(S.transition) return;
+  if(goal){ player.x=goal.x; player.y=goal.y; player.vx=0; player.vy=0; }
+  // the one rung marked THE NEXT LEVEL, and what is actually on the far side
+  if(S.opening==='ladder'){ S.opening='reveal'; S.openDone=true; S.hint=''; S.hintA=0; }
+  shatter(true);
+}
+
+/* The Routine is not a puzzle. It is a tempo, and a question about when to
+   stop. Behind the amber filter the world becomes a staircase and a metronome
+   and nothing else: you put your foot down on the beat, and the ground you
+   cannot see goes by underneath at its own rate.
+
+   A habit has no idea where it is. It works exactly as well over the ledge you
+   were aiming for as it does over the drop past it, and it will carry you
+   cheerfully off the end. Step off too early and the slope you were stairing
+   over takes you back down. Step off in the window and you are standing on the
+   ledge. Step off late — or let it run to its own end — and there is nothing
+   under you. The only way to know is to listen to your own footsteps. */
+const STAIR_DX=72, STAIR_DY=-26;          // how a step looks, not how far it goes
+const STAIR_STEPS=48;                      // how many mornings this one has in it
+const BEAT_SLOW=0.86, BEAT_FAST=0.52;     // the years ask for it faster
+const WIN_GOOD=0.13, WIN_OK=0.24;         // on the beat, near enough, and not
+const STUMBLE_COST=1.3;
+
+function buildRoutine(x0){
+  const {edge,exit}=nextObstacle(x0);
+  const gx=Math.min(exit===null?edge+700:exit+40,x0+ARMOR_REACH);
+  // it means to cover that ground in about forty mornings. It does not stop
+  // there, because stopping is not something a routine knows how to do.
+  S.stride=clamp((gx-x0)/40,6,46);
+  S.routineLeft=STAIR_STEPS; S.cadence=0; S.stumbles=0;
+  S.beatDur=BEAT_SLOW; S.beatT=BEAT_SLOW; S.beatHit=0; S.stepAnim=1; S.stepLock=0;
+  return [{vx:0,vy:0,ground:standable(x0)}];
+}
+// how far from the nearest beat you are, in seconds
+function routineBeatOff(){ return Math.min(S.beatT,S.beatDur-S.beatT); }
+// whether there is anything under this morning — never shown, only heard
+function routineOnGround(){ return terrainY(player.x)!==null&&standable(player.x); }
+
+function routineStep(){
+  if(S.mode!=='armored'||S.armor!=='routine'||S.transition) return;
+  if(S.routineLeft<=0) return;
+  // A day is a day. Pressing four times inside one beat does not buy you four
+  // mornings, and a habit you can hurry is not the thing this is about.
+  if(S.stepLock>0) return;
+  const off=routineBeatOff();
+  if(off>WIN_OK){
+    // out of time with yourself: the step does not happen and the day is longer
+    S.stumbles++; S.cadence=0; S.armT=Math.max(0,S.armT-STUMBLE_COST);
+    S.stepLock=S.beatDur*0.34;
+    S.ceilingFlash=0.7; SFX.smash(false); vibrate([20]);
+    return;
+  }
+  S.stepLock=S.beatDur*0.62;
+  const clean=off<=WIN_GOOD;
+  const n=S.routineTrack[S.routineTrack.length-1];
+  // the world goes by underneath at its own rate, whatever the stairs look like
+  player.x+=S.stride; player.y=terrainYSafe(player.x);
+  const ground=routineOnGround();
+  S.routineTrack.push({vx:n.vx+STAIR_DX,vy:n.vy+STAIR_DY,ground});
+  if(S.routineTrack.length>40) S.routineTrack.shift();
+  S.routineIdx++; S.routineLeft--; S.stepAnim=0;
+  S.cadence=clean?S.cadence+1:0;
+  S.beatHit=clean?1:0.55;
+  // the tell, and the only one: a morning over ground and a morning over
+  // nothing do not sound the same, if you are still listening
+  if(ground) SFX.wood(); else SFX.tick(false);
+  vibrate(clean?6:11);
+  if(S.routineLeft<=0) routineStops();
+}
+function routineStops(){
+  if(S.routineEnd) return;
+  S.routineEnd=true; S.stranded=true; S.ceilingFlash=1; vibrate([8,40,8]);
+}
+function routineArrived(){ return false; }   // arriving is now your call, not its
+
+/* ---------------------------------------------------------- THE DOGMA ---
+   Speed and destruction. Everything ahead sorts into Pure and Corrupt, and the
+   Corrupt can simply be smashed. One of the things you smash was holding up
+   the road. */
+/* A cause does not pick its way down a road. It goes flat out, in a straight
+   line, and removes what is in front of it — and the faster it goes the better
+   it works, right up to the speed at which it can no longer see what it is
+   removing. That is the entire game in here: hold the line, hit the thing in
+   front of you, do not stop. Nothing on this screen will tell you what any of
+   it was, and the count at the end arrives after it is all already down. */
+const DOG_V0=180, DOG_VMAX=575, DOG_ACC=58;
+const DOG_GAIN=46;            // what one clean hit is worth
+const DOG_WIN=125;            // how far ahead of you a swing connects
+const DOG_WHIFF=150, DOG_FLOOR=115;   // what swinging at nothing costs, and the
+                              // speed below which even that cannot take you
+const DOG_STALL=1.05;         // seconds face-down after going into one
+const DOG_TIME=30;
+function buildDogma(x0){
+  const out=[], end=(L.exposed?L.exposed.x0:L.goalX+40);
+  if(L.rubble) for(const b of L.rubble){
+    if(b<=x0+80||b>end) continue;
+    if(!S.cleared.has(b)) out.push({x:b,dead:false});
+  }
+  S.dogV=DOG_V0; S.dogStall=0; S.dogHits=0; S.dogSlams=0; S.dogSwing=0;
+  S.dogEnd=end; S.dogSwingReq=false; S.dogFlash=0;
+  S.armTMax=DOG_TIME; S.armT=DOG_TIME;
+  return out;
+}
+// the only verb it has
+function dogmaSwing(){
+  if(S.mode!=='armored'||S.armor!=='dogma'||S.transition||S.stranded) return;
+  S.dogSwingReq=true;
+}
+
+/* --------------------------------------------------------- THE REFUGE ---
+   A warm ring containing you and one other. Inside it there is no dread at all.
+   The companion has a lifespan, and is not told to you. */
+function buildRefuge(x0){
+  const runs=[];
+  // how far the companion can walk before its light goes out
+  S.thread=REFUGE_SLACK; S.refugeNear=true; S.refugeD=0;
+  return {x:x0+56,y:terrainYSafe(x0+56),life:REFUGE_LIFE,max:REFUGE_LIFE,
+          gone:false,ph:rr(0,6.283),vx:60};
+}
+// how much of the ring is left. Nothing else ever says.
+function refugeRing(){
+  const C=S.companion;
+  return lerp(REFUGE_R1,REFUGE_R0,C?clamp(C.life/C.max,0,1):0);
+}
+const COLLAPSE_DUR=3.0;       // seconds on your knees, and not one you can skip
+/* Walking is the one thing that helps, and it helps less the longer you have
+   been doing it. The pressure is not behind you, so you cannot walk away from
+   it; somewhere around the minute mark it stops mattering how fast you are
+   going. Then you go down, and you get up, and it starts again.
+
+   Putting an armour on is the only thing that sets the clock back to nothing.
+   That is the whole offer, and it is also the whole cost: the same ridge, at
+   the same speed, with none of it visible. */
+const EXPOSE_FULL=46;         // seconds before walking has stopped buying anything
+const EXPOSE_RATE=0.085;      // and what being out in the open costs by then
+/* Every project of meaning costs you something in lucidity, and the ones that
+   break under you cost more. The floor is what you can no longer get below —
+   each illusion leaves you a little harder to fool, which is the arc. */
+const FLOOR_BASE=0.16, FLOOR_EQUIP=0.04, FLOOR_BREAK=0.10, FLOOR_CAP=0.46;
+const lived=new Set();        // armours you have worn: you learn a reach by living it
+/* The ring is not drawn around you. It is drawn around somebody else, and it
+   moves at their speed, which is not steady and was never yours to set. Inside
+   it the ground is lit and nothing is dying. Outside it there is no ground at
+   all, and a thread between you that only has so much give.
+
+   The ring closes as their life runs down, which is the only way you are ever
+   told how much of it is left. */
+const REFUGE_LIFE=30;         // seconds of company, hidden from the player
+const REFUGE_R0=330, REFUGE_R1=112;   // the ring at the start, and at the end
+const REFUGE_SLACK=4.0;       // seconds of thread, once you are outside it
+const REFUGE_V=142;           // what you can do. Not what they do.
+
+/* ------------------------------------------------------- THE CREATION ---
+   You draw the ground you walk on, in gold, over nothing. It holds while the
+   paint is wet. There is a finite amount of paint and you are not told how much. */
+/* You get one line and a fixed amount of it, and the far side of the hall is
+   higher than this one. Steer it flat and you arrive under the ledge with paint
+   in hand and nowhere to put it; steer it steep and you run out over the middle
+   of the room. And it dries from the far end back towards you, so there is no
+   standing still on your own work and no going back over it either. */
+const PAINT_TOTAL=1250;       // world units of line, hidden from the player
+const PAINT_DRY=8.0;          // seconds before a drawn span goes brittle
+const CREATE_V=118;           // how fast a line goes down
+const CREATE_ANG=0.62;        // and how steeply you are allowed to want it
+
+/* -------------------------------------------------------- THE ARCHIVE ---
+   Every gap becomes an angle. Solve it, jump it, land. Until a gap whose
+   solution does not exist. */
+/* Reason will do the sum for you. It will not do it wrong, and it will not do
+   it for a distance it cannot reach, and it never once says which of those two
+   it is up against. The aim sweeps; you stop it where you think; it draws you
+   the arc it computed and puts you exactly there. Getting it wrong does not
+   drop you — it simply makes you do the sum again, faster, with less left. */
+const ARCH_V=760, ARCH_G=1500;
+const ARCH_SWEEP=0.80, ARCH_SWEEP_ERR=0.08;   // radians a second, and per mistake
+const ARCH_LO=0.20, ARCH_HI=1.46;             // the angles it is willing to consider
+const ARCH_TIME=60, ARCH_MISS=2.5;
+const ARCH_SPAN=210;
+// the furthest a fixed launch speed will ever carry, which is not a matter of
+// opinion and is the whole of the ending of this one
+const archRange=()=>ARCH_V*ARCH_V/ARCH_G;
+function buildArchive(x0){
+  const y0=terrainYSafe(x0);
+  const out=[{x:x0,y:y0,w:120,ok:true}];
+  const {edge,exit}=nextObstacle(x0);
+  const far=(exit===null?edge+2400:exit);
+  const r=mulberry32(Math.round(x0*5.9)+229);
+  const R=archRange();
+  const endX=far+46, endY=terrainYSafe(endX);
+  let x=x0, y=y0, i=0;
+  while(i<40){
+    const rem=endX-x;
+    if(rem<=R*0.80) break;
+    const k=clamp((x-x0)/Math.max(1,endX-x0),0,1);
+    // the sums get longer and the answers get narrower
+    let dx=lerp(215,R*0.80,k)*lerp(0.95,1.05,r());
+    if(rem-dx<180) dx=rem-180;
+    if(dx<150) break;
+    const cand={x:x+dx,y:lerp(y0,endY,k)-lerp(34,116,Math.abs(Math.sin(i*1.7))),
+                w:lerp(132,94,k),ok:true};
+    // it never sets down a sum it cannot do. That is its entire reputation.
+    let guard=0;
+    while(guard++<14&&!archReachable(out[out.length-1],cand)) cand.x-=24;
+    out.push(cand); x=cand.x; y=cand.y; i++;
+  }
+  // the far side of the hall, in stone, which is where it lets you off
+  out.push({x:endX,y:endY,w:150,ok:true,ground:true});
+  // and one more, set down at a distance no angle it will consider answers
+  out.push({x:endX+R*1.42,y:endY-80,w:88,ok:false});
+  S.archAng=ARCH_LO; S.archDir=1; S.archErr=0; S.archShort=0;
+  S.armTMax=ARCH_TIME; S.armT=ARCH_TIME;
+  return out;
+}
+/* Where a launch at this angle actually comes down, from where you are, given
+   that the next thing along may be higher or lower than you are. */
+function archSolve(ang,from,to){
+  const vx=Math.cos(ang)*ARCH_V, vy=-Math.sin(ang)*ARCH_V;
+  const dy=to.y-from.y;                       // +y is down
+  const disc=vy*vy+2*ARCH_G*dy;
+  if(disc<0) return null;
+  const t=(-vy+Math.sqrt(disc))/ARCH_G;
+  return {t,x:from.x+vx*t};
+}
+
+const ARMORS={
+  climb:{name:'THE CLIMB',theme:'CAREER & STATUS',glyph:'▲',dir:'up',
+         key:P.climb.cyan,dark:'#000000',zoom:0.82},
+  routine:{name:'THE ROUTINE',theme:'HABIT & STRUCTURE',glyph:'■',dir:'down',
+         key:P.routine.amber,dark:P.routine.dark},
+  dogma:{name:'THE DOGMA',theme:'IDEOLOGY & CAUSE',glyph:'◄',dir:'left',
+         key:'#E63946',dark:'#050505'},
+  refuge:{name:'THE REFUGE',theme:'FAMILY & KIN',glyph:'►',dir:'right',
+         key:'#FB8500',dark:'#0F0D0E'},
+  creation:{name:'THE CREATION',theme:'ART & MONUMENT',glyph:'✦',dir:'up',
+         key:'#FFD700',dark:'#08040C',sub:'#7B2CBF'},
+  archive:{name:'THE ARCHIVE',theme:'LOGIC & KNOWLEDGE',glyph:'◆',dir:'down',
+         key:'#00FF66',dark:'#020E0A',sub:'#003B19'}
+};
+// which slot on the wheel each armour occupies, per level
+const WHEEL_SLOTS={climb:'up',routine:'down',dogma:'left',refuge:'right',
+                   creation:'up',archive:'down'};
+
+/* ---------------------------------------------------------- THE SHORE ---
+   The last level has no armour, so it has no track, no nodes and no fuel. It
+   has a tempo. The water breathes; you either move with it or you fight it,
+   and fighting it is the only thing on this level that costs you anything. */
+const BEAT=2.6;               // seconds per breath of the water
+const BEAT_OPEN=0.46;         // the part of the breath that carries you forward
+const CALM_GAIN=0.52, CALM_LOSS=0.64;
+const CALM_HOLD=0.03, CALM_STILL=0.5;   // standing still settles you, but only so far
+const PUSH_BACK=0.30;                   // what pushing against the water is worth
+const MONO_W=190, MONO_H=430; // the obsidian mirror at the middle of the shore
+const ZOOM_SKY=3.9;           // how far the camera rises at the end
+const EPI_LINE=6.2;           // seconds each closing line is held
+const beatPhase=()=>((S.t/BEAT)%1+1)%1;
+const withWater=()=>beatPhase()<BEAT_OPEN;
+
+/* ================================================================ STATE === */
+const S={
+  screen:'title',        // title | play | complete
+  mode:'lucid',          // lucid | armored
+  armor:null,
+  unlocked:new Set(),    // armors offered on the wheel
+  t:0, dt:0, wall:0,
+  dread:0,
+  collapsed:0,           // seconds remaining while frozen on knees
+  grace:0,               // and the numb stretch afterwards, where nothing lands
+  lucidStreak:0,
+  shattered:0,           // number of times the armour has broken
+  transition:null,
+  wheelOpen:false, wheelSel:null, wheelT:0,
+  climbTrack:[], climbIdx:0, climbDash:null, deadEnd:false, deadEndT:0, climbLeft:0,
+  routineTrack:[], routineIdx:0, routineDash:null, routineCadence:0, routineEnd:false, routineLeft:0,
+  beatDur:0.8, beatT:0, beatHit:0, beatHeld:false, cadence:0, stumbles:0, stepLock:0,
+  floor:0.16,            // the pressure you can no longer get below on this level
+  worn:0, broken:0,      // illusions this crossing took, and how many gave way
+  stranded:false, strandT:0,
+  levelIdx:0, cleared:new Set(), interT:0,
+  companion:null, paint:1, trail:[], aim:null, thread:0, refugeNear:true, refugeD:0,
+  paintAng:0, paintGoal:0, paintFrom:0, paintLand:0,
+  archAng:0.2, archDir:1, archErr:0, archShort:0, archIdx:0, archUndef:false, archTrack:[],
+  dogmaTrack:[], dogmaIdx:0, dogmaDash:null,
+  dogV:0, dogStall:0, dogHits:0, dogSlams:0, dogSwing:0, dogFlash:0, dogSwingReq:false, dogEnd:0,
+  intro:0, goalA:1,
+  exposure:0,            // seconds unarmoured since the last time you went down
+  /* Level one does not start in the world. See enterOpening. */
+  opening:'', openTry:0, openDone:false, tear:null, revealT:0,
+  falling:false, fallV:0, fade:0, fadeTarget:0,
+  ceilingFlash:0,
+  hint:'', hintA:0, everDown:false,
+  ended:false, endT:0,
+  sunT:0,
+  /* the shore: an act, a tempo, and how much you have stopped resisting */
+  act:'', actT:0, calm:0, lastBeat:-1, wheelSeen:false,
+  choiceSel:null, crack:0, flood:0, light:0, dim:0, epiI:-1, epiT:0,
+  zt:0, camK:2.4, wide:false
+};
+
+const player={x:-120,y:0,vx:0,tremor:0,facing:1,kneel:0};
+player.y=terrainYSafe(player.x);
+
+const cam={x:0,y:0,tx:0,ty:0};
+function camTarget(){
+  // The closing shot stops leading the walker anywhere and simply holds them,
+  // small, in the middle of everything.
+  if(S.wide){ cam.tx=player.x-VIEW_W*0.5; cam.ty=player.y-VIEW_H*0.54; return; }
+  // The reveal: framed on the gap first — the one thing nine storeys of ladder
+  // were drawn on top of — and only afterwards on the person standing past it.
+  if((S.revealT>0||S.opening==='reveal')&&L.coldOpen){
+    // held wide for the whole dissolve, so the frame is already on the ridge by
+    // the time there is enough of it to see
+    const k=S.opening==='reveal'?0:smooth(inv(REVEAL_LOCK,REVEAL_HOLD,REVEAL_HOLD-S.revealT));
+    const gap=L.gaps[0], mid=(gap.x0+gap.x1)/2;
+    // the whole gap in frame, and the one who crossed it small over on the right
+    cam.tx=lerp(lerp(mid,player.x,0.25)-VIEW_W*0.5,player.x-VIEW_W*0.29,k);
+    cam.ty=lerp(terrainYSafe(player.x)-VIEW_H*0.60,player.y-VIEW_H*0.62,k);
+    return;
+  }
+  // in the jumping game the frame holds the rungs still and lets you move in it,
+  // rather than chasing every hop
+  if(S.mode==='armored'&&S.armor==='climb'&&S.baseY!==undefined){
+    const cx=(S.course&&S.course.cx!==undefined)?S.course.cx:player.x;
+    cam.tx=cx-VIEW_W*0.5; cam.ty=S.baseY-VIEW_H*0.70; return;
+  }
+  // the arc goes up; the frame has to leave room over the pad you launched from
+  if(S.mode==='armored'&&S.armor==='archive'&&S.archTrack.length){
+    const a=S.archTrack[S.archIdx]||{y:player.y};
+    cam.tx=player.x-VIEW_W*0.34; cam.ty=a.y-VIEW_H*0.72; return;
+  }
+  // Unarmored looks further ahead — you can see where you are going, and how far.
+  cam.tx=player.x-VIEW_W*(S.mode==='armored'?0.40:0.29);
+  cam.ty=player.y-VIEW_H*(S.mode==='armored'?0.66:0.62);
+}
+/* The one shot the whole game is built to pay off: the blinders come off for
+   the first time and the frame opens on what was behind them. It opens in one
+   continuous movement — the aperture of the armour, then the gap and the person
+   who crossed it, then the whole width the unarmoured state normally sees — and
+   it is held still, and for a few seconds nothing is asked of the player except
+   that they look at it. (Zoom here is view height: larger sees more.) */
+const REVEAL_DUR=3.2, REVEAL_HOLD=8.6, REVEAL_LOCK=3.6, REVEAL_ZOOM=1.06;
+const INTRO_DUR=5.6, INTRO_HOLD=2.1;
+function skipIntro(){ if(S.intro>INTRO_DUR-INTRO_HOLD-0.4) S.intro=Math.min(S.intro,INTRO_DUR-INTRO_HOLD-0.4); else S.intro=Math.min(S.intro,0.4); }
+camTarget(); cam.x=cam.tx; cam.y=cam.ty;
+
+/* ============================================================== PROMPTS === */
+// Verbatim from lucid_design_prompt_1.md
+const PROMPT_TEXT={
+  start:'"To see everything at once is to be unable to move."',
+  chasm:'"Infinity asks nothing of you. That is why it terrifies you."',
+  climb:'"A small goal is a quiet mercy."',
+  grid:'"Ignore the sky. Focus on the next step."',
+  wall:'"Every project promises forever. Every project ends."',
+  shatter:'"The lie breaks. The world remains."',
+  naked:'"You cannot stay naked forever."',
+  routine:'"If you cannot conquer eternity, structure the morning."',
+  done:'"You survived today. Tomorrow will demand another story."',
+  scar:'"Each one you break leaves you harder to fool. That is not the same as being free."',
+  /* The long walk. Four lines in two and a half minutes, and a great deal of
+     nothing in between them, which is the part that does the work. */
+  walk1:'"No one arranged any of this for you. You are looking at it anyway."',
+  walk2:'"Everything here keeps its own time. None of it is keeping yours."',
+  walk3:'"The stone forgets. That is the whole of its advantage over you."',
+  walk4:'"You have been afraid of this your whole life. It is a hillside."',
+  walk5:'"Nothing is happening, and you are finding that difficult."',
+  walk6:'"You walked a long way and nothing happened. That was the walk."',
+  /* --- Level 2 --- */
+  city:'"We build cities to convince ourselves we are not alone in the dark."',
+  dogma:'"A cause is a place to put the fear."',
+  dogmaRun:'"Everything in the way is in the way on purpose."',
+  dogmaWall:'"When you fight for a cause, you forget what you were building."',
+  refuge:'"Inside this ring, nothing is dying."',
+  refugeGone:'"We hide inside those we love, forgetting they are fragile too."',
+  cityDone:'"You were never alone. That was never the problem."',
+  /* --- Level 3 --- */
+  vault:'"Marble lasts longer than bone. It turns to dust all the same."',
+  creation:'"If nothing will hold you, make something that will."',
+  creationDry:'"You made a monument to yourself, but you still have to walk past it."',
+  archive:'"What can be measured cannot frighten you."',
+  archRun:'"Reason is a wonderful place to hide."',
+  archUndef:'"Reason can map the cage, but it cannot unlock the door."',
+  vaultDone:'"You have tried to conquer, to love, to fight, and to build. What happens when you simply stop running?"',
+  /* --- Level 4 --- */
+  shore:'"Nothing here is hidden from you. Nothing here is coming for you either."',
+  empty:'"There are no lies left to tell."',
+  ease:'"The terror was not in the world. It was in your resistance to it."',
+  mirror:'"Everything you built to outlive you, still here, still yours."',
+  nihil:'"To call it meaningless is still to demand that it serve you."',
+  leap:'"Then the meaning was never out there waiting. You make it, knowing it ends."'
+};
+/* The last words of the game, fading in line by line over the widening shore. */
+const EPILOGUE=[
+  'You are a fleeting thing.',
+  'An animal who knows it will die, standing in an infinite universe.',
+  'You do not need an armor to justify your existence.',
+  'The illusion gave you safety.\nThe truth gives you the world.'
+];
+const fired=new Set();
+const promptQ=[];
+let activePrompt=null;
+const PR_IN=1.7, PR_HOLD=3.0, PR_OUT=1.4;
+
+function say(id,tint){
+  if(fired.has(id)) return;
+  fired.add(id);
+  promptQ.push({text:PROMPT_TEXT[id],tint:tint||'#FFFFFF',t:0});
+}
+function updatePrompts(dt){
+  if(!activePrompt&&promptQ.length) activePrompt=promptQ.shift();
+  if(activePrompt){
+    activePrompt.t+=dt;
+    if(activePrompt.t>PR_IN+PR_HOLD+PR_OUT) activePrompt=null;
+  }
+}
+function promptAlpha(p){
+  if(p.t<PR_IN) return smooth(p.t/PR_IN)*0.6;
+  if(p.t<PR_IN+PR_HOLD) return 0.6;
+  return 0.6*(1-smooth((p.t-PR_IN-PR_HOLD)/PR_OUT));
+}
+
+/* ================================================================ AUDIO === */
+const AU={
+  ctx:null,on:true,ready:false,
+  master:null,lucidBus:null,armorBus:null,
+  windLo:null,windHi:null,drone:[],heart:0,tick:0,
+  noiseBuf:null
+};
+function mkNoise(actx,sec,brown){
+  const buf=actx.createBuffer(1,actx.sampleRate*sec,actx.sampleRate);
+  const d=buf.getChannelData(0); let last=0;
+  for(let i=0;i<d.length;i++){
+    const w=Math.random()*2-1;
+    if(brown){ last=(last+0.02*w)/1.02; d[i]=last*3.2; } else d[i]=w;
+  }
+  return buf;
+}
+function audioStart(){
+  if(AU.ready) return;
+  const AC=window.AudioContext||window.webkitAudioContext;
+  if(!AC) return;
+  const a=new AC(); AU.ctx=a; AU.ready=true;
+
+  AU.master=a.createGain(); AU.master.gain.value=0.9; AU.master.connect(a.destination);
+  AU.lucidBus=a.createGain(); AU.lucidBus.gain.value=0.0; AU.lucidBus.connect(AU.master);
+  AU.armorBus=a.createGain(); AU.armorBus.gain.value=0.0; AU.armorBus.connect(AU.master);
+  AU.noiseBuf=mkNoise(a,3,false);
+
+  /* --- unarmored bed: 35–80Hz rumble + airy wind + heavy minor drone ----- */
+  const brown=mkNoise(a,5,true);
+  const rumbleSrc=a.createBufferSource(); rumbleSrc.buffer=brown; rumbleSrc.loop=true;
+  const rumbleF=a.createBiquadFilter(); rumbleF.type='lowpass'; rumbleF.frequency.value=80; rumbleF.Q.value=0.7;
+  const rumbleG=a.createGain(); rumbleG.gain.value=0.55;
+  rumbleSrc.connect(rumbleF).connect(rumbleG).connect(AU.lucidBus); rumbleSrc.start();
+  AU.windLo=rumbleG;
+
+  const airSrc=a.createBufferSource(); airSrc.buffer=mkNoise(a,4,false); airSrc.loop=true;
+  const airF=a.createBiquadFilter(); airF.type='bandpass'; airF.frequency.value=620; airF.Q.value=0.6;
+  const airG=a.createGain(); airG.gain.value=0.05;
+  airSrc.connect(airF).connect(airG).connect(AU.lucidBus); airSrc.start();
+  AU.windHi=airG;
+  // slow gusting
+  const gust=a.createOscillator(); gust.frequency.value=0.07;
+  const gustG=a.createGain(); gustG.gain.value=0.035;
+  gust.connect(gustG).connect(airG.gain); gust.start();
+
+  [32.7,49.0,77.78].forEach((f,i)=>{ // C1 G1 Eb2 — unresolved, heavy
+    const o=a.createOscillator(); o.type=i===2?'triangle':'sine'; o.frequency.value=f;
+    const g=a.createGain(); g.gain.value=[0.16,0.10,0.05][i];
+    const lfo=a.createOscillator(); lfo.frequency.value=0.05+i*0.017;
+    const lg=a.createGain(); lg.gain.value=f*0.004;
+    lfo.connect(lg).connect(o.frequency); lfo.start();
+    // kept as nodes, not just gains: the last level has to retune this chord
+    o.connect(g).connect(AU.lucidBus); o.start(); AU.drone.push({o,g});
+  });
+
+  if(a.state==='suspended') a.resume();
+}
+function env(node,t0,peak,atk,dec){
+  node.gain.cancelScheduledValues(t0);
+  node.gain.setValueAtTime(0.0001,t0);
+  node.gain.exponentialRampToValueAtTime(Math.max(peak,0.0002),t0+atk);
+  node.gain.exponentialRampToValueAtTime(0.0001,t0+atk+dec);
+}
+function blip(freq,type,peak,atk,dec,dest,when){
+  if(!AU.ready) return;
+  const a=AU.ctx,t0=(when||a.currentTime);
+  const o=a.createOscillator(); o.type=type||'sine'; o.frequency.setValueAtTime(freq,t0);
+  const g=a.createGain(); env(g,t0,peak,atk,dec);
+  o.connect(g).connect(dest||AU.master); o.start(t0); o.stop(t0+atk+dec+0.05);
+  return o;
+}
+function noiseHit(peak,dur,filt,freq,Q,dest,when){
+  if(!AU.ready) return;
+  const a=AU.ctx,t0=(when||a.currentTime);
+  const s=a.createBufferSource(); s.buffer=AU.noiseBuf;
+  s.playbackRate.value=0.8+Math.random()*0.5;
+  const f=a.createBiquadFilter(); f.type=filt||'bandpass'; f.frequency.value=freq||1200; f.Q.value=Q||1;
+  const g=a.createGain(); env(g,t0,peak,0.004,dur);
+  s.connect(f).connect(g).connect(dest||AU.master); s.start(t0); s.stop(t0+dur+0.1);
+  return f;
+}
+const SFX={
+  shutter(){ if(!AU.ready)return; const t=AU.ctx.currentTime;
+    noiseHit(0.32,0.045,'bandpass',2600,1.4,AU.master,t);
+    noiseHit(0.26,0.06,'bandpass',1500,1.1,AU.master,t+0.075);
+    blip(180,'square',0.10,0.002,0.05,AU.master,t); },
+  snap(){ if(!AU.ready)return; const t=AU.ctx.currentTime;
+    blip(4000,'sine',0.10,0.001,0.018,AU.armorBus,t);
+    noiseHit(0.10,0.03,'highpass',3200,0.8,AU.armorBus,t); },
+  wood(){ if(!AU.ready)return; const t=AU.ctx.currentTime;
+    noiseHit(0.14,0.035,'bandpass',1250,3.5,AU.armorBus,t);
+    blip(690,'sine',0.09,0.002,0.05,AU.armorBus,t); },
+  tick(soft){ if(!AU.ready)return; const t=AU.ctx.currentTime;
+    blip(soft?740:900,'square',soft?0.018:0.030,0.001,soft?0.05:0.028,AU.armorBus,t); },
+  shatter(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    const f=noiseHit(0.42,0.28,'highpass',5200,0.7,AU.master,t);
+    if(f) f.frequency.exponentialRampToValueAtTime(500,t+0.28);
+    for(let i=0;i<9;i++) blip(2200+Math.random()*4200,'sine',0.055,0.001,0.10+Math.random()*0.2,AU.master,t+Math.random()*0.16);
+    // 0.2s of silence, then the bass drop as the world rushes back
+    const o=a.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(150,t+0.30); o.frequency.exponentialRampToValueAtTime(33,t+0.95);
+    const g=a.createGain(); env(g,t+0.30,0.44,0.05,0.85);
+    o.connect(g).connect(AU.master); o.start(t+0.30); o.stop(t+1.4); },
+  dissolve(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    [261.6,329.6,392.0,523.3].forEach((f,i)=>blip(f,'sine',0.10,0.6,2.4,AU.master,t+i*0.16)); },
+  collapse(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    const o=a.createOscillator(); o.type='sine';
+    o.frequency.setValueAtTime(90,t); o.frequency.exponentialRampToValueAtTime(28,t+1.2);
+    const g=a.createGain(); env(g,t,0.5,0.02,1.3); o.connect(g).connect(AU.master); o.start(t); o.stop(t+1.6); },
+  heart(strength){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    const thump=(when,amp)=>{ const o=a.createOscillator(); o.type='sine';
+      o.frequency.setValueAtTime(62,when); o.frequency.exponentialRampToValueAtTime(30,when+0.14);
+      const g=a.createGain(); env(g,when,amp,0.012,0.16);
+      o.connect(g).connect(AU.master); o.start(when); o.stop(when+0.34); };
+    thump(t,0.10+strength*0.36); thump(t+0.21,0.06+strength*0.22); },
+  smash(hard){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    // industrial thud; corrupt shapes break with a bass shatter
+    noiseHit(hard?0.30:0.14,hard?0.16:0.07,'lowpass',hard?420:900,0.9,AU.armorBus,t);
+    const o=a.createOscillator(); o.type='square';
+    o.frequency.setValueAtTime(hard?150:220,t); o.frequency.exponentialRampToValueAtTime(hard?42:90,t+0.18);
+    const g=a.createGain(); env(g,t,hard?0.26:0.12,0.004,0.2);
+    o.connect(g).connect(AU.armorBus); o.start(t); o.stop(t+0.4); },
+  pluck(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    // warm acoustic figure for the ring
+    [392.0,493.9,587.3].forEach((f,i)=>blip(f,'triangle',0.05,0.006,0.9,AU.armorBus,t+i*0.05)); },
+  brush(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    noiseHit(0.035,0.10,'bandpass',2200,0.8,AU.armorBus,t); },
+  ping(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    blip(1760,'sine',0.06,0.001,0.09,AU.armorBus,t);
+    blip(2640,'sine',0.03,0.001,0.06,AU.armorBus,t+0.02); },
+  glitch(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    for(let i=0;i<12;i++) blip(300+Math.random()*3000,'square',0.05,0.001,0.04,AU.master,t+i*0.03);
+    const o=a.createOscillator(); o.type='sawtooth';
+    o.frequency.setValueAtTime(600,t); o.frequency.exponentialRampToValueAtTime(60,t+0.5);
+    const g=a.createGain(); env(g,t,0.16,0.01,0.5);
+    o.connect(g).connect(AU.master); o.start(t); o.stop(t+0.7); },
+  lifespan(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    [587.3,440.0,349.2,261.6].forEach((f,i)=>blip(f,'sine',0.08,0.3,1.6,AU.master,t+i*0.26)); },
+  /* The shore. Water arriving, once a breath — brighter the calmer you are. */
+  lap(calm){ if(!AU.ready)return; const t=AU.ctx.currentTime;
+    noiseHit(0.020+calm*0.032,0.85,'lowpass',380+calm*560,0.8,AU.lucidBus,t); },
+  /* The one consonance in the game: the low unresolved hum the whole way down
+     is the same three notes, and here one of them is finally let go of. */
+  resolve(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    const to=[32.70,49.00,82.41];                 // C1 · G1 · E2 — the third opens
+    AU.drone.forEach((d,i)=>{
+      d.o.frequency.setTargetAtTime(to[i],t,1.7);
+      d.g.gain.setTargetAtTime([0.19,0.13,0.10][i],t,2.2);
+    });
+    [261.63,329.63,392.00,523.25].forEach((f,i)=>blip(f,'sine',0.075,1.7,6.8,AU.master,t+i*0.22)); },
+  cello(){ if(!AU.ready)return; const a=AU.ctx,t=a.currentTime;
+    [130.8,196.0].forEach((f,i)=>{
+      const o=a.createOscillator(); o.type='sawtooth'; o.frequency.value=f*(1+(Math.random()-0.5)*0.004);
+      const fl=a.createBiquadFilter(); fl.type='lowpass'; fl.frequency.value=420; fl.Q.value=1.4;
+      const g=a.createGain(); env(g,t,0.055-i*0.02,2.6,5.2);
+      o.connect(fl).connect(g).connect(AU.lucidBus); o.start(t); o.stop(t+9); }); }
+};
+function audioTick(dt){
+  if(!AU.ready) return;
+  const a=AU.ctx, tc=0.25;
+  let wantLucid=(S.mode==='lucid'||(S.transition&&S.transition.type==='shatter'&&S.transition.t>0.3))?1:0.06;
+  // and through a tear it comes in further each time, which is how most people
+  // find out there is anything on the other side of what they are doing
+  if(S.tear) wantLucid=Math.max(wantLucid,0.14+0.15*S.tear.g);
+  AU.lucidBus.gain.setTargetAtTime((AU.on?1:0)*wantLucid*(S.screen==='title'?0.35:1),a.currentTime,tc);
+  AU.armorBus.gain.setTargetAtTime((AU.on?1:0)*(S.mode==='armored'?1:0.0),a.currentTime,0.08);
+  // on the shore the rumble is the same threat it always was, until you stop
+  // bracing against it, at which point it is just weather
+  const ease=L.shore?1-0.45*S.calm:1;
+  if(AU.windLo) AU.windLo.gain.setTargetAtTime((0.34+S.dread*0.55)*ease,a.currentTime,0.6);
+  if(AU.windHi) AU.windHi.gain.setTargetAtTime((0.035+S.dread*0.05)*ease,a.currentTime,0.6);
+
+  if(S.screen==='play'&&S.mode==='lucid'&&AU.on){
+    AU.heart-=dt;
+    if(AU.heart<=0){
+      SFX.heart(L.shore?S.dread*0.55:S.dread);
+      // the pulse slows to the tempo of the water rather than racing it
+      AU.heart=L.shore?lerp(1.5,BEAT,S.calm):lerp(1.55,0.62,S.dread);
+    }
+  }
+  if(S.screen==='play'&&S.mode==='armored'&&AU.on){
+    AU.tick-=dt;
+    if(AU.tick<=0){
+      // the ladder's clock: the metronome tightens as the quarter runs out
+      if(S.armor==='climb'){ SFX.tick(S.armT>6); AU.tick=clamp(S.armT*0.055,0.16,0.5); }
+      else if(S.armor==='routine'){ SFX.tick(true); AU.tick=0.5; }  // metronome
+      else if(S.armor==='dogma'){ SFX.smash(false); AU.tick=0.32; } // industrial pulse
+      else if(S.armor==='refuge'){ SFX.pluck(); AU.tick=2.0; }      // 60 BPM warmth
+      else if(S.armor==='creation'){ SFX.brush(); AU.tick=0.42; }   // brush strokes
+      else { SFX.ping(); AU.tick=0.66; }                             // calculation pings
+    }
+  }
+  if(S.screen==='play'&&S.mode==='lucid'&&AU.on){
+    AU.cello=(AU.cello||6)-dt;
+    if(AU.cello<=0){ SFX.cello(); AU.cello=rr(15,24); }
+  }
+}
+
+/* ================================================================ INPUT === */
+const keys=new Set();
+const ptr={down:false,x:0,y:0,sx:0,sy:0,moved:0};
+const touches=new Map();
+let lastTapT=-9, lastTapX=0, lastTapY=0;
+let usedMove=false, usedWheel=false;
+
+function toView(e){ const r=cv.getBoundingClientRect();
+  return {x:(e.clientX-r.left)/r.width*VIEW_W, y:(e.clientY-r.top)/r.height*VIEW_H}; }
+
+function beginPlay(){
+  audioStart();
+  if(S.screen==='title'){ S.screen='play'; loadLevel(0); }
+}
+
+cv.addEventListener('pointerdown',e=>{
+  cv.setPointerCapture&&cv.setPointerCapture(e.pointerId);
+  const v=toView(e);
+  touches.set(e.pointerId,{...v,t:S.wall});
+  if(S.screen==='title'){ beginPlay(); return; }
+  if(S.screen==='interstitial'){ if(S.interT>1.2) nextLevel(); return; }
+  if(S.screen==='complete') return;
+  audioStart();
+  if(S.intro>0){ skipIntro(); return; }
+
+  // the only question the game ever asks you
+  if(S.act==='ask'){ const c=choiceHit(v); if(c) chooseMirror(c==='yes'); return; }
+
+  if(e.button===2){ if(S.mode==='lucid') openWheel(v); return; }
+
+  // double-tap / double-click -> step off the armour. Not in the opening: in
+  // there every tap is a jump, and there is nothing to step off onto.
+  if(S.opening!=='ladder'){
+    const dt=S.wall-lastTapT, dd=Math.hypot(v.x-lastTapX,v.y-lastTapY);
+    if(dt<0.34&&dd<70){ lastTapT=-9; stripAway(); return; }
+    lastTapT=S.wall; lastTapX=v.x; lastTapY=v.y;
+  }
+
+  if(touches.size>=2&&S.mode==='lucid'){ openWheel(v); return; }
+
+  ptr.down=true; ptr.x=v.x; ptr.y=v.y; ptr.sx=v.x; ptr.sy=v.y; ptr.moved=0;
+  document.body.classList.add('dragging');
+
+  if(S.mode==='armored'&&!S.transition){
+    armorTap();
+  }
+},{passive:true});
+
+cv.addEventListener('pointermove',e=>{
+  const v=toView(e);
+  if(touches.has(e.pointerId)) touches.set(e.pointerId,{...v,t:S.wall});
+  if(ptr.down){ ptr.moved+=Math.hypot(v.x-ptr.x,v.y-ptr.y); ptr.x=v.x; ptr.y=v.y; }
+  if(S.wheelOpen) updateWheelSel(v);
+},{passive:true});
+
+function endPointer(e){
+  touches.delete(e.pointerId);
+  if(S.wheelOpen&&touches.size===0){ commitWheel(); }
+  if(touches.size===0){ ptr.down=false; document.body.classList.remove('dragging'); }
+}
+cv.addEventListener('pointerup',endPointer,{passive:true});
+cv.addEventListener('pointercancel',endPointer,{passive:true});
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+
+window.addEventListener('keydown',e=>{
+  if(e.repeat){ return; }
+  const k=e.key.toLowerCase();
+  if(S.screen==='title'){ beginPlay(); e.preventDefault(); return; }
+  if(S.screen==='interstitial'){ if(S.interT>1.2) nextLevel(); e.preventDefault(); return; }
+  keys.add(k);
+  if(S.intro>0&&k!=='m'&&k!=='h'){ skipIntro(); return; }
+  if(S.act==='ask'){ if(k==='y') chooseMirror(true); else if(k==='n') chooseMirror(false); }
+  // the wheel latches the direction on the press. Polling held keys once a
+  // frame drops a quick tap, and dropping it looks exactly like a dead game.
+  if(S.wheelOpen){
+    if(k==='arrowup'||k==='w') S.wheelSel=armorInSlot('up');
+    else if(k==='arrowdown'||k==='s') S.wheelSel=armorInSlot('down');
+    else if(k==='arrowleft') S.wheelSel=armorInSlot('left');
+    else if(k==='arrowright') S.wheelSel=armorInSlot('right');
+  }
+  if(k===' '||k==='spacebar'){
+    e.preventDefault();
+    if(S.mode==='lucid'&&!S.transition&&S.screen==='play') openWheel(null);
+    else armorTap();
+  }
+  if(k==='arrowup'||k==='w'){ if(S.mode==='armored') jumpPressed(); }
+  if(k==='escape'||k==='q'){ stripAway(); }
+  if(k==='m'){ AU.on=!AU.on; }
+  if(k==='r'&&S.screen==='play'&&!S.transition){ S.fadeTarget=1; S.restarting=true; }
+  if(k==='h'||k==='?'){ S.showHelp=!S.showHelp; }
+  if(S.mode==='armored'&&!S.transition){
+    // the climb and the routine read held keys in the update loop instead, so
+    // that they can offer two answers rather than one
+    if(k==='arrowright'||k==='d'){
+      if(S.armor==='dogma'||S.armor==='archive') armorTap();
+    }
+  }
+},{passive:false});
+window.addEventListener('keyup',e=>{
+  const k=e.key.toLowerCase();
+  keys.delete(k);
+  if((k===' '||k==='spacebar')&&S.wheelOpen) commitWheel();
+});
+window.addEventListener('blur',()=>{keys.clear();ptr.down=false;touches.clear();});
+
+/* --------------------------------------------------------- armor wheel --- */
+function openWheel(v){
+  // Deliberately available while you are on your knees. Being unable to move is
+  // exactly the moment a person reaches for something to put between them and
+  // the world; refusing them the wheel there would be refusing them the game.
+  if(S.mode!=='lucid'||S.transition||S.falling||S.intro>0) return;
+  // and not while the reveal is still being looked at
+  if(S.revealT>REVEAL_HOLD-REVEAL_LOCK) return;
+  // once the shore has asked its question, the habit is no longer available
+  if(L.shore&&S.act!=='wake'&&S.act!=='walk'&&S.act!=='mirror') return;
+  S.wheelOpen=true; S.wheelT=0; S.wheelSel=null; usedWheel=true;
+  // The level's first armour is always available; later ones unlock by enduring.
+  // On the ridge both are offered from the start: choosing between them, and
+  // choosing where to stand when you do, is the whole of the game there.
+  // On the shore there is no first armour, and the habit of reaching for one is
+  // exactly what the level is about.
+  if(L.proto) L.armors.forEach(a=>S.unlocked.add(a));
+  else if(L.armors[0]) S.unlocked.add(L.armors[0]);
+  else S.wheelSeen=true;
+  if(v) updateWheelSel(v);
+}
+function updateWheelSel(v){
+  if(!S.wheelOpen) return;
+  const cx=VIEW_W/2, cy=VIEW_H/2;
+  const dx=v.x-cx, dy=v.y-cy, d=Math.hypot(dx,dy);
+  if(d<52){ S.wheelSel=null; return; }
+  const ang=Math.atan2(dy,dx);
+  let dirn;
+  if(ang<-Math.PI*0.75||ang>Math.PI*0.75) dirn='left';
+  else if(ang<-Math.PI*0.25) dirn='up';
+  else if(ang<Math.PI*0.25) dirn='right';
+  else dirn='down';
+  S.wheelSel=armorInSlot(dirn);
+}
+function commitWheel(){
+  if(!S.wheelOpen) return;
+  S.wheelOpen=false;
+  const sel=S.wheelSel; S.wheelSel=null;
+  if(sel&&S.unlocked.has(sel)) equip(sel);
+}
+// keyboard selection while the wheel is held
+function armorInSlot(dirn){
+  const own=L.armors.find(k=>WHEEL_SLOTS[k]===dirn);
+  if(own) return own;
+  return Object.keys(ARMORS).find(k=>WHEEL_SLOTS[k]===dirn&&!L.armors.includes(k))||null;
+}
+function wheelKeys(){
+  if(!S.wheelOpen) return;
+  if(keys.has('arrowup')||keys.has('w')) S.wheelSel=armorInSlot('up');
+  if(keys.has('arrowdown')||keys.has('s')) S.wheelSel=armorInSlot('down');
+  if(keys.has('arrowleft')) S.wheelSel=armorInSlot('left');
+  if(keys.has('arrowright')) S.wheelSel=armorInSlot('right');
+}
+
+/* ============================================================ TRANSITIONS = */
+const EQUIP_DUR=0.7, SHATTER_DUR=1.2, DISSOLVE_DUR=2.0;
+
+function equip(which){
+  if(S.transition) return;
+  S.transition={type:'equip',t:0,dur:EQUIP_DUR,armor:which};
+  SFX.shutter();
+  vibrate([28,90,12]);
+}
+function finishEquip(which){
+  S.mode='armored'; S.armor=which; S.transition=null; S.lucidStreak=0; S.exposure=0;
+  S.stranded=false; S.strandT=0;
+  // and you are up again, which is the entire proposition of an armour
+  S.collapsed=0; S.pendingCollapse=false; player.kneel=0;
+  S.worn++;
+  // reaching for one at all costs you a little of the ground you can get back to
+  if(L.proto) S.floor=Math.min(FLOOR_CAP,S.floor+FLOOR_EQUIP);
+  if(which==='climb'){
+    /* the impassable thing in front of you, redrawn as a game with an answer */
+    S.course=buildClimbCourse(player.x,player.y);
+    S.armTMax=courseTime(0); S.armT=S.armTMax;
+    S.onPlat=S.course[0]; S.baseY=S.course[0].y; S.coyote=COYOTE; S.jbuf=0; player.vy=0; S.reachT=0;
+    S.courseFrom={x:player.x,y:player.y};
+    say('climb',P.climb.cyan);
+  } else if(which==='routine'){
+    S.routineTrack=buildRoutine(player.x);
+    S.routineIdx=0; S.routineEnd=false; S.routineCadence=0; S.reachT=0;
+    S.armTMax=ARMOR_TIME; S.armT=S.armTMax;
+    S.courseFrom={x:player.x,y:player.y};
+    say('routine',P.routine.gold);
+  } else if(which==='dogma'){
+    S.dogmaTrack=buildDogma(player.x);
+    S.dogmaIdx=0; S.dogmaDash=null; S.archUndef=false;
+    say('dogma',ARMORS.dogma.key);
+  } else if(which==='refuge'){
+    S.companion=buildRefuge(player.x);
+    say('refuge',ARMORS.refuge.key);
+  } else if(which==='creation'){
+    S.paint=PAINT_TOTAL; S.trail=[{x:player.x,y:player.y,age:0}];
+    S.paintAng=0; S.paintFrom=player.x; S.paintLand=0;
+    // the far side of whatever is in front of you, which is what it has to reach
+    { const {edge,exit}=nextObstacle(player.x);
+      S.paintGoal=(exit===null?edge+600:exit); }
+    say('creation',ARMORS.creation.key);
+  } else if(which==='archive'){
+    S.archTrack=buildArchive(player.x);
+    S.archIdx=0; S.archUndef=false; S.aim=null;
+    player.y=S.archTrack[0].y;
+    say('archive',ARMORS.archive.key);
+  }
+  AU.tick=0;
+}
+
+/* Stepping off an illusion while you are standing on something real costs you
+   nothing — you finished it rather than broke it. Stepping off one in mid-air
+   is what breaking a lie actually is, and that is what leaves a mark. */
+function onRealGround(){
+  const gy=terrainY(player.x);
+  return gy!==null&&standable(player.x)&&Math.abs(player.y-gy)<=CLIMB_LAND;
+}
+function stripAway(){
+  if(S.mode!=='armored'||S.transition) return;
+  // There is no door on the inside of your first one. You did not put it on.
+  if(S.opening==='ladder') return;
+  shatter(L.proto?onRealGround():false);
+}
+
+function shatter(soft){
+  if(S.transition||S.mode!=='armored') return;
+  // snapshot the armoured frame so it can be broken into shards
+  snapCtx.setTransform(1,0,0,1,0,0);
+  snapCtx.clearRect(0,0,snapCv.width,snapCv.height);
+  snapCtx.setTransform(SCALE,0,0,SCALE,0,0);
+  drawArmored(snapCtx,S.armor,1,1);
+  const dur=soft?(S.opening==='reveal'?REVEAL_DUR:DISSOLVE_DUR):SHATTER_DUR;
+  S.transition={type:'shatter',t:0,dur,soft:!!soft,shards:makeShards()};
+  if(soft) SFX.dissolve(); else SFX.shatter();
+  vibrate(soft?[10,60,10]:[150]);
+}
+function finishShatter(soft){
+  const wasArmor=S.armor;
+  S.mode='lucid'; S.armor=null; S.transition=null; S.shattered++; S.exposure=0;
+  S.stranded=false; S.strandT=0; S.deadEnd=false; S.routineEnd=false;
+  if(S.pendingCollapse){ S.pendingCollapse=false; S.collapsed=COLLAPSE_DUR; SFX.collapse(); }
+  lived.add(wasArmor);                     // now you know what one of those buys
+  if(!soft) S.broken++;
+  if(L.proto&&!soft) S.floor=Math.min(FLOOR_CAP,S.floor+FLOOR_BREAK);
+  S.lucidStreak=0;
+  S.dread=Math.max(S.floor,Math.min(1,S.dread+(soft?0.0:0.30)));
+  player.vx=0; player.vy=0; player.tremor=soft?0.4:1.6;
+  if(!soft) say('shatter');
+  if(L.proto&&!soft&&S.shattered>=2) say('scar');
+  // The staircase was never out there — it was a way of not looking at the
+  // slope. Step off one onto ground too steep to stand on and you go down it,
+  // back to the last place that would hold you.
+  if(!soft&&terrainY(player.x)!==null&&!standable(player.x)){
+    let sx=player.x;
+    while(sx>L.terrain[0][0]&&!(terrainY(sx)!==null&&standable(sx))) sx-=8;
+    if(sx!==player.x){ player.x=sx; SFX.smash(true); S.dread=Math.min(1,S.dread+0.18); }
+  }
+  // Standing on nothing: the lie was the only bridge.
+  if(terrainY(player.x)===null){ S.falling=true; S.fallV=0; }
+  else player.y=terrainYSafe(player.x);
+  /* The first one comes off and the argument of the whole game is made in one
+     cut: the ladder was drawn over this, you are a small warm thing standing on
+     a real ledge, and the drop you spent nine storeys not looking at is behind
+     you. The weight arrives a few seconds later. First it is only beautiful. */
+  if(S.opening==='reveal'){
+    S.opening=''; S.revealT=REVEAL_HOLD; S.hint=''; S.hintA=0;
+    S.dread=0; S.floor=FLOOR_BASE; S.grace=REVEAL_HOLD; S.exposure=0;
+    S.lucidStreak=0; player.tremor=0.3; player.kneel=0;
+    S.worn=1;                    // you crossed on one. You just did not pick it.
+    usedMove=false;              // and the ground moves differently over here
+    fired.delete('start'); say('start');
+  }
+  if(wasArmor==='refuge'&&S.companion&&S.companion.gone&&!soft) say('refugeGone');
+  if(wasArmor==='creation'&&!soft) say('creationDry');
+  // an illusion that carried you the whole way sets you down and dissolves;
+  // one that merely set you down somewhere real just goes, and costs nothing
+  if(soft&&player.x>L.goalX-40){ S.ended=true; S.endT=0; say(['done','cityDone','vaultDone'][S.levelIdx]); }
+}
+// Angles only — the triangles are rebuilt each frame, because the view widens
+// as the blinders come off and stale coordinates would leave the corners bare.
+/* ------------------------------------------------------------ level load */
+function loadLevel(i){
+  S.levelIdx=clamp(i,0,LEVELS.length-1);
+  L=LEVELS[S.levelIdx];
+  PROPS=L.build();
+  S.cleared.clear();
+  computeRegions();
+  fired.clear(); promptQ.length=0; activePrompt=null;
+  S.openDone=false;
+  restartLevel();
+  // a level that opens inside an armour has no establishing shot to give away
+  S.intro=(L.coldOpen&&!S.openDone)?0:INTRO_DUR;
+}
+function nextLevel(){
+  if(S.levelIdx<LEVELS.length-1){ loadLevel(S.levelIdx+1); S.screen='play'; }
+  else S.screen='complete';
+}
+
+/* Everything a project of meaning left behind, swept up. */
+function clearArmorState(){
+  S.climbTrack=[]; S.climbIdx=0; S.climbDash=null; S.deadEnd=false;
+  S.course=[]; S.onPlat=null; S.baseY=undefined; S.jbuf=0; S.coyote=0; S.armT=0; S.armTMax=1;
+  S.routineTrack=[]; S.routineIdx=0; S.routineDash=null; S.routineEnd=false; S.reachT=0;
+  S.cadence=0; S.stumbles=0; S.beatHit=0; S.beatHeld=false; S.stepLock=0;
+  S.dogmaTrack=[]; S.dogmaIdx=0; S.dogmaDash=null;
+  S.dogV=0; S.dogStall=0; S.dogHits=0; S.dogSlams=0; S.dogSwing=0; S.dogFlash=0; S.dogSwingReq=false;
+  S.stranded=false; S.strandT=0; S.ceilingFlash=0;
+  S.companion=null; S.paint=PAINT_TOTAL; S.trail=[]; S.aim=null;
+  S.thread=REFUGE_SLACK; S.refugeNear=true; S.refugeD=0;
+  S.archTrack=[]; S.archIdx=0; S.archUndef=false; S.archDash=null;
+  S.archAng=ARCH_LO; S.archDir=1; S.archErr=0; S.archShort=0;
+  S.paintAng=0; S.paintGoal=0; S.paintFrom=0; S.paintLand=0;
+  player.vy=0;
+}
+
+/* You did not die; you fell. What you lose is the thing you built and the
+   ground it covered — not the afternoon. You come back to the last piece of
+   ground that would have held you, shaking, and start from there. */
+function recover(){
+  clearArmorState();
+  player.x=(player.safe===undefined?L.spawn:player.safe);
+  player.y=terrainYSafe(player.x); player.vx=0; player.tremor=1.5; player.kneel=0;
+  S.mode='lucid'; S.armor=null; S.transition=null; S.wheelOpen=false; S.wheelSel=null;
+  S.falling=false; S.fallV=0; S.collapsed=0; S.pendingCollapse=false;
+  S.dread=Math.max(0.62,S.floor); S.grace=2.5; S.lucidStreak=0; S.exposure=0; S.fadeTarget=0;
+  zoom=ZOOM_LUCID; applyZoom(); camTarget(); cam.x=cam.tx; cam.y=cam.ty;
+}
+
+/* The lie was the only thing holding you up. Begin this level again. */
+function restartLevel(){
+  S.cleared.clear(); computeRegions();
+  player.x=L.spawn; player.y=terrainYSafe(L.spawn); player.vx=0; player.tremor=0.9; player.kneel=0;
+  player.safe=L.spawn;
+  S.mode='lucid'; S.armor=null; S.transition=null; S.wheelOpen=false; S.wheelSel=null;
+  S.dread=0.22; S.collapsed=0; S.pendingCollapse=false; S.lucidStreak=0; S.shattered=0;
+  S.grace=0; S.deadEndSeen=false; S.everDown=false; S.floor=FLOOR_BASE; S.worn=0; S.broken=0;
+  S.exposure=0;
+  clearArmorState();
+  S.falling=false; S.fallV=0; S.ended=false; S.endT=0;
+  S.unlocked.clear(); S.goalA=1; S.fadeTarget=0;
+  // the shore, from the top: trembling, unarmoured, out of illusions
+  S.act=L.shore?'wake':''; S.actT=0; S.calm=0; S.lastBeat=-1; S.wheelSeen=false;
+  S.choiceSel=null; S.crack=0; S.flood=0; S.light=0; S.dim=0; S.epiI=-1; S.epiT=0;
+  S.zt=0; S.camK=2.4; S.wide=false;
+  S.opening=''; S.openTry=0; S.tear=null; S.revealT=0;
+  if(PROPS&&PROPS.ripples) PROPS.ripples.length=0;
+  zoom=ZOOM_LUCID; applyZoom(); camTarget(); cam.x=cam.tx; cam.y=cam.ty;
+  // and once it has been earned, it is not taken back: restarting the ridge
+  // puts you on the ridge, unarmoured, with the wheel already yours
+  if(L.coldOpen&&!S.openDone) enterOpening();
+}
+
+/* ========================================================== THE OPENING === */
+/* The first level does not open on the ridge. It opens nine storeys up a
+   ladder that is not there, with a clock in the corner and a cut line coming
+   up underneath, and nothing anywhere on the screen admits that there is a
+   world. Which is roughly the situation of a person, and it is not something
+   they chose either: the armour is already on by the time you can ask.
+
+   There is exactly one way out of it, and it is marked THE NEXT LEVEL. */
+function enterOpening(){
+  S.opening='ladder'; S.openTry=0;
+  // the lines that would give the frame away do not get to fire in here
+  fired.add('climb'); fired.add('grid'); fired.add('start');
+  startOpeningLadder();
+}
+function startOpeningLadder(){
+  const c=L.coldOpen;
+  player.x=c.x; player.y=terrainYSafe(c.x); player.vx=0; player.vy=0;
+  player.safe=c.x; player.tremor=0; player.kneel=0; player.facing=1;
+  S.mode='armored'; S.armor='climb'; S.transition=null; S.tear=null;
+  S.stranded=false; S.strandT=0; S.collapsed=0; S.pendingCollapse=false;
+  S.falling=false; S.fallV=0; S.dread=0; S.fade=0; S.fadeTarget=0;
+  S.course=buildClimbCourse(player.x,player.y,S.openTry);
+  S.armTMax=courseTime(S.openTry); S.armT=S.armTMax;
+  S.onPlat=S.course[0]; S.platX=platX(S.course[0]);
+  S.baseY=S.course[0].y; S.coyote=COYOTE; S.jbuf=0; S.reachT=0;
+  S.courseFrom={x:player.x,y:player.y};
+  S.ceilingFlash=0; AU.tick=0;
+  zoom=ARMORS.climb.zoom; applyZoom(); camTarget(); cam.x=cam.tx; cam.y=cam.ty;
+}
+/* Failing does not hand you the world. The frame slips — a band or two of
+   something that is not this, too brief and too broken to read — and then you
+   are back at the bottom of the ladder with the clock reset. That is what
+   failing at a project actually gets you: the project again.
+
+   What it does do is slip a little further every time. Nobody gets all the way
+   through this without noticing that something is behind it. */
+const TEAR_SKY=0.50;                       // where the horizon sits in the tear's frame
+function makeTearBands(g){
+  const r=mulberry32(g*977+13), n=1+Math.min(4,Math.ceil(g*0.8));
+  const reach=lerp(0.05,0.42,(g-1)/5);      // how near the middle of the frame it dares
+  const th=lerp(0.015,0.105,(g-1)/5);       // and how much of it comes through
+  const out=[];
+  for(let i=0;i<n;i++){
+    const side=(i%2)?1:-1;
+    out.push({yf:clamp(0.5+side*(0.47-reach*r())-th/2,0.005,0.98),
+              hf:th*lerp(0.55,1.45,r())});
+  }
+  // and by the fourth time one of them opens across the horizon itself, which is
+  // the one thing in the picture that cannot be mistaken for a rendering fault
+  if(g>=4) out.push({yf:TEAR_SKY-th*0.8,hf:th*lerp(1.4,2.1,r())});
+  return out;
+}
+function openingTear(){
+  if(S.tear||S.transition) return;
+  S.openTry++;
+  const g=Math.min(S.openTry,6);
+  snapCtx.setTransform(1,0,0,1,0,0);
+  snapCtx.clearRect(0,0,snapCv.width,snapCv.height);
+  snapCtx.setTransform(SCALE,0,0,SCALE,0,0);
+  drawArmored(snapCtx,'climb',1,1);
+  S.tear={t:0,dur:0.30+g*0.12,g,bands:makeTearBands(g)};
+  S.ceilingFlash=1; SFX.smash(false); vibrate([16,40,16]);
+  if(g>=3) SFX.cello();                     // by now it is coming through the wall
+}
+
+function makeShards(){
+  const N=18, out=[], angs=[];
+  for(let i=0;i<N;i++) angs.push(i/N*Math.PI*2+rr(-0.09,0.09));
+  for(let i=0;i<N;i++){
+    const a1=angs[i], a2=angs[(i+1)%N]+(i===N-1?Math.PI*2:0);
+    out.push({a1,a2,dx:Math.cos((a1+a2)/2),dy:Math.sin((a1+a2)/2),rot:rr(-0.3,0.3),sp:rr(0.7,1.35)});
+  }
+  return out;
+}
+function shardTri(s){
+  const cx=VIEW_W/2, cy=VIEW_H/2, R=Math.hypot(VIEW_W,VIEW_H);
+  return [[cx,cy],[cx+Math.cos(s.a1)*R,cy+Math.sin(s.a1)*R],[cx+Math.cos(s.a2)*R,cy+Math.sin(s.a2)*R]];
+}
+function vibrate(pat){ if(navigator.vibrate&&AU.on){ try{navigator.vibrate(pat);}catch(e){} } }
+
+/* ================================================================ CLIMB === */
+/* Inside the blinders it is a jumping game, and a jumping game is a wonderful
+   thing: it has edges, it has an answer, and while you are playing it you are
+   not thinking about anything else. That is the entire service being rendered. */
+function jumpPressed(){
+  if(S.mode!=='armored'||S.transition) return;
+  S.jbuf=BUFFER;
+}
+/* One press, whatever you happen to be wearing. Each armour reads it as the
+   only verb it has: jump, step, smash, solve. */
+function armorTap(){
+  if(S.mode!=='armored'||S.transition||S.tear) return;
+  if(S.armor==='climb') jumpPressed();
+  else if(S.armor==='routine') routineStep();
+  else if(S.armor==='dogma') dogmaSwing();
+  else if(S.armor==='archive') archiveJump();
+}
+
+/* Smash forward. The thing that stops you is the thing you smashed. */
+
+/* Solve the gap, jump the gap. Until the gap has no solution. */
+function archiveJump(){
+  if(S.archDash||S.archUndef||S.transition) return;
+  const T=S.archTrack, n=S.archIdx+1;
+  if(n>=T.length){
+    S.archUndef=true; S.stranded=true; S.ceilingFlash=1;
+    say('archUndef',ARMORS.archive.key); SFX.glitch(); return;
+  }
+  const from=T[S.archIdx], to=T[n];
+  const hit=archSolve(S.archAng,from,to);
+  const err=hit?(hit.x-to.x):1e9;
+  if(hit&&Math.abs(err)<=to.w/2){
+    S.archDash={from:{x:from.x,y:from.y},to,t:0,tof:hit.t,dur:Math.max(0.26,hit.t*0.82),ang:S.archAng};
+    S.archIdx=n; SFX.ping(); vibrate(10);
+    // a sum that comes out gives you back one that did not: the aim speeds up
+    // with your mistakes, but it is no longer a ratchet
+    if(S.archErr>0) S.archErr--;
+    say('archRun',ARMORS.archive.key);
+    return;
+  }
+  /* Reason does not drop you. It retracts the derivation, charges you for it,
+     and starts the aim moving faster than it was before. */
+  S.archErr++; S.armT=Math.max(0,S.armT-ARCH_MISS);
+  S.ceilingFlash=0.8; SFX.glitch(); vibrate([26,24,26]);
+  // and if no angle at all would have answered, it has run out of arithmetic
+  if(!archReachable(from,to)){
+    S.archShort++;
+    if(S.archShort>=2){
+      S.archUndef=true; S.stranded=true; S.ceilingFlash=1;
+      say('archUndef',ARMORS.archive.key); vibrate([40,30,40]);
+    }
+  }
+}
+// whether any angle it is willing to consider gets there at all
+function archReachable(from,to){
+  for(let a=ARCH_LO;a<=ARCH_HI;a+=0.02){
+    const h=archSolve(a,from,to);
+    if(h&&Math.abs(h.x-to.x)<=to.w/2) return true;
+  }
+  return false;
+}
+
+/* ================================================================ SHORE === */
+/* The Great Silence has no track to advance along and no armour to break. It
+   runs as a short sequence of acts, and its only mechanic is whether you are
+   moving with the water or against it. Nothing here can fail; the worst that
+   happens is that you stay heavy. */
+
+function spawnRipple(x,s){
+  if(!PROPS.ripples) return;
+  PROPS.ripples.push({x,t:0,life:lerp(3.4,6.2,s),s});
+  if(PROPS.ripples.length>70) PROPS.ripples.shift();
+}
+
+// The two words the whole game has been walking towards.
+function choiceBoxes(){
+  // sized off the frame, so the two answers still fit side by side on a phone
+  const w=clamp(VIEW_W*0.17,us(108),us(178)), h=us(58), y=VIEW_H*0.855;
+  const gap=Math.max(w*0.24,us(28));
+  return [{key:'yes',label:'YES',x:VIEW_W/2-gap/2-w,y,w,h},
+          {key:'no', label:'NO', x:VIEW_W/2+gap/2,y,w,h}];
+}
+function choiceHit(v){
+  if(S.act!=='ask') return null;
+  for(const b of choiceBoxes())
+    if(v.x>b.x&&v.x<b.x+b.w&&v.y>b.y-b.h/2&&v.y<b.y+b.h/2) return b.key;
+  return null;
+}
+function chooseMirror(yes){
+  if(S.act!=='ask') return;
+  S.choiceSel=yes?'yes':'no'; S.act=yes?'nihil':'dissolve'; S.actT=0;
+  if(yes){ say('nihil'); SFX.collapse(); vibrate([220]); }
+  else { say('leap'); SFX.resolve(); vibrate([14,70,14,70,14]); }
+}
+
+function updateShore(dt,dir){
+  S.actT+=dt; S.lucidStreak+=dt;
+  const A=S.act;
+  /* the water breathes once every BEAT, whether or not you are listening */
+  const bi=Math.floor(S.t/BEAT);
+  if(bi!==S.lastBeat){
+    S.lastBeat=bi;
+    if(A!=='wake') spawnRipple(player.x,S.calm);
+    if(S.flood>0&&S.flood<1) spawnRipple(L.monoX,1);
+    SFX.lap(S.calm);
+  }
+  if(PROPS.ripples) for(let i=PROPS.ripples.length-1;i>=0;i--){
+    const r=PROPS.ripples[i]; r.t+=dt;
+    if(r.t>r.life) PROPS.ripples.splice(i,1);
+  }
+
+  const walk=(maxv,resp,limit)=>{
+    player.vx+=(dir*maxv-player.vx)*(1-Math.exp(-dt*resp));
+    if(Math.abs(player.vx)<0.5&&dir===0) player.vx=0;
+    const nx=clamp(player.x+player.vx*dt,regionAt(player.x)[0],limit);
+    if(nx!==player.x) player.facing=Math.sign(nx-player.x)||player.facing;
+    if(nx>=limit&&player.vx>0) player.vx=0;
+    player.x=nx; player.y=L.water;
+  };
+  const drift=(sp,resp)=>{ player.vx=lerp(player.vx,sp,1-Math.exp(-dt*resp));
+                           player.x+=player.vx*dt; player.y=L.water; };
+  const hintNow=h=>{ S.hint=h; S.hintA=lerp(S.hintA,h?1:0,1-Math.exp(-dt*3)); };
+  const STOP=L.monoX-MONO_W/2-76;   // you cannot walk through your own reflection
+
+  if(A==='wake'){
+    /* Act I — The Empty Wheel. You are here, it is enormous, and the first
+       thing anyone reaches for is something to put between them and it. */
+    walk(30,1.15,STOP);
+    S.calm=Math.max(0,S.calm-dt*0.05);
+    player.tremor=lerp(player.tremor,1.55,1-Math.exp(-dt*1.6));
+    S.dread=lerp(S.dread,0.66,1-Math.exp(-dt*0.7));
+    hintNow(S.wheelSeen?'':(IS_TOUCH?'Hold two thumbs to focus':'Hold SPACE to focus'));
+    // the act turns on finding the wheel spent — or, for anyone who never
+    // reaches for it, on standing here long enough to work it out alone
+    if((S.wheelSeen&&!S.wheelOpen&&S.actT>1.0)||S.actT>28){ say('empty'); S.act='walk'; S.actT=0; }
+  }
+
+  else if(A==='walk'){
+    /* Act II — Learning to Walk Unarmoured. Fight the water and it stays
+       heavy. Move when it moves and it carries you. */
+    const open=withWater();
+    if(Math.abs(dir)>0.25) S.calm+=(open?CALM_GAIN:-CALM_LOSS)*dt;
+    else if(S.calm<CALM_STILL) S.calm+=CALM_HOLD*dt;
+    S.calm=clamp(S.calm,0,1);
+    // Shoving forward while the water is drawing back is the resistance this
+    // level is about, and it is answered the way water answers anything: you
+    // still move, badly, and it is exhausting.
+    walk(lerp(30,182,S.calm)*(open?1:PUSH_BACK),lerp(1.3,5.6,S.calm)*(open?1:0.55),STOP);
+    // the violent vibration does not stop; it becomes a pulse, in time
+    const pulse=0.16*S.calm*Math.sin(beatPhase()*6.283);
+    player.tremor=lerp(player.tremor,lerp(1.5,0.26,S.calm)+pulse,1-Math.exp(-dt*2.4));
+    S.dread=lerp(S.dread,(1-S.calm)*0.62,1-Math.exp(-dt*1.2));
+    if(S.calm>0.72) say('ease');
+    hintNow(S.calm>0.55?'':'Move when the water moves');
+    if(player.x>=STOP-1){ S.act='mirror'; S.actT=0; player.vx=0; }
+  }
+
+  else if(A==='mirror'){
+    /* Act III — The Mirror. Everything you built, showing up in the obsidian. */
+    const open=withWater();
+    walk(lerp(30,182,S.calm)*(open?1:PUSH_BACK),lerp(1.3,5.6,S.calm)*(open?1:0.55),STOP);
+    player.tremor=lerp(player.tremor,lerp(1.4,0.30,S.calm),1-Math.exp(-dt*2));
+    S.dread=lerp(S.dread,(1-S.calm)*0.48,1-Math.exp(-dt*1.2));
+    if(S.actT>1.4) say('mirror');
+    hintNow('');
+    if(S.actT>5.0){ S.act='ask'; S.actT=0; }
+  }
+
+  else if(A==='ask'){
+    player.vx=0; player.y=L.water;
+    player.tremor=lerp(player.tremor,0.50,1-Math.exp(-dt*2));
+    S.dread=lerp(S.dread,0.34,1-Math.exp(-dt*1.2));
+    S.dim=lerp(S.dim,0.18,1-Math.exp(-dt*2));
+    hintNow(IS_TOUCH?'Answer it':'Answer it · Y or N');
+  }
+
+  else if(A==='nihil'){
+    /* [ YES ] — the nihilist trap. The screen goes out, and so do you. It is
+       not a game over. It is an answer that does not get you anywhere. */
+    player.vx=0; player.kneel=lerp(player.kneel,1,1-Math.exp(-dt*2.2));
+    player.tremor=lerp(player.tremor,0.16,1-Math.exp(-dt*1.4));
+    S.dim=lerp(S.dim,S.actT<7.0?0.90:0.18,1-Math.exp(-dt*2.2));
+    hintNow('');
+    // the question comes back, and so does the answer to that answer: say YES
+    // as often as you like and it will tell you the same thing every time
+    if(S.actT>9.4){ S.act='ask'; S.actT=0; S.choiceSel=null; player.kneel=0; fired.delete('nihil'); }
+  }
+
+  else if(A==='dissolve'){
+    /* [ NO ] — the wall splits, and everything held in it comes out as light. */
+    S.dim=lerp(S.dim,0,1-Math.exp(-dt*2));
+    S.crack=clamp(S.crack+dt/1.5,0,1);
+    if(S.crack>=1) S.flood=clamp(S.flood+dt/3.4,0,1);
+    S.light=clamp(S.light+dt*0.10,0,0.34);
+    player.vx=0; player.y=L.water;
+    player.tremor=lerp(player.tremor,0.30,1-Math.exp(-dt*1.5));
+    S.dread=lerp(S.dread,0.10,1-Math.exp(-dt*0.8));
+    hintNow('');
+    if(S.flood>=1){ S.act='walkout'; S.actT=0; }
+  }
+
+  else if(A==='walkout'){
+    /* The gift of finitude: weightless controls. The tremor never leaves —
+       it simply stops being the thing you are listening to. */
+    S.calm=lerp(S.calm,1,1-Math.exp(-dt*1.5));
+    S.light=clamp(S.light+dt*0.09,0,0.55);
+    walk(205,7,L.goalX+60);
+    player.tremor=lerp(player.tremor,0.22+0.10*Math.sin(beatPhase()*6.283),1-Math.exp(-dt*2));
+    S.dread=lerp(S.dread,0,1-Math.exp(-dt*1.5));
+    hintNow(S.actT<8?(IS_TOUCH?'Walk':'Drag, or →, to walk'):'');
+    if(player.x>L.goalX-40){ S.act='rise'; S.actT=0; S.wide=true; S.camK=0.9; S.zt=ZOOM_SKY; }
+  }
+
+  else if(A==='rise'){
+    // the camera lets go of you and climbs. You keep walking anyway.
+    drift(58,0.8);
+    player.tremor=lerp(player.tremor,0.20,1-Math.exp(-dt*1.2));
+    S.light=clamp(S.light+dt*0.03,0,0.62);
+    hintNow('');
+    if(S.actT>4.5){ S.act='epilogue'; S.actT=0; S.epiI=0; S.epiT=0; }
+  }
+
+  else if(A==='epilogue'){
+    drift(52,0.5);
+    player.tremor=lerp(player.tremor,0.18,1-Math.exp(-dt*1.2));
+    S.epiT+=dt;
+    if(S.epiT>EPI_LINE){ S.epiT=0; S.epiI++; if(S.epiI>=EPILOGUE.length){ S.act='over'; S.actT=0; } }
+  }
+
+  else if(A==='over'){
+    drift(44,0.4);
+    if(S.actT>7.4){ S.fadeTarget=1; if(S.fade>0.96) S.screen='complete'; }
+  }
+}
+
+/* ============================================================== UPDATE ==== */
+// The Creation is the one armour that asks which way is up.
+function moveInputY(){
+  let d=0;
+  if(keys.has('arrowup')||keys.has('w')) d-=1;
+  if(keys.has('arrowdown')||keys.has('s')) d+=1;
+  if(ptr.down&&!S.wheelOpen&&touches.size<2){
+    const dy=ptr.y-ptr.sy;
+    if(Math.abs(dy)>10) d=clamp(dy/110,-1,1);
+  }
+  return clamp(d,-1,1);
+}
+function moveInput(){
+  let d=0;
+  if(keys.has('arrowleft')||keys.has('a')) d-=1;
+  if(keys.has('arrowright')||keys.has('d')) d+=1;
+  if(ptr.down&&!S.wheelOpen&&touches.size<2){
+    const dx=ptr.x-ptr.sx;
+    if(Math.abs(dx)>10) d=clamp(dx/130,-1,1);
+  }
+  return clamp(d,-1,1);
+}
+
+function update(dt){
+  S.wall+=dt;
+  if(S.screen==='interstitial'){ S.interT+=dt; audioTick(dt); return; }
+  if(S.screen!=='play'){ if(S.screen==='complete') S.doneT=(S.doneT||0)+dt; audioTick(dt); return; }
+  S.t+=dt;
+  // Levels 1–3 sink through a twilight as the session runs. The shore is already
+  // night, and stays night: nothing there is running out.
+  S.sunT=L.shore?0.5:Math.min(1,S.t/420);
+  updatePrompts(dt);
+  wheelKeys();
+  S.ceilingFlash=Math.max(0,S.ceilingFlash-dt*0.8);
+
+  /* ---- the frame slips ---- */
+  if(S.tear){
+    S.tear.t+=dt;
+    if(S.tear.t>=S.tear.dur){ S.tear=null; startOpeningLadder(); }
+    audioTick(dt); return;
+  }
+
+  /* ---- zoom follows state: the world opens as a lie breaks, closes as one locks in */
+  const az=(S.armor&&ARMORS[S.armor].zoom)||ZOOM_ARMOR;
+  let zt=(S.mode==='armored')?az:ZOOM_LUCID;
+  if(S.transition&&S.transition.type==='equip') zt=lerp(ZOOM_LUCID,(ARMORS[S.transition.armor].zoom||ZOOM_ARMOR),smooth(inv(0.10,0.58,S.transition.t)));
+  if(S.transition&&S.transition.type==='shatter')
+    zt=lerp(az,S.opening==='reveal'?REVEAL_ZOOM:ZOOM_LUCID,smooth(inv(0.28,0.95,S.transition.t)));
+  // and then keeps opening, out to the width this state always sees
+  if(S.revealT>0) zt=lerp(REVEAL_ZOOM,ZOOM_LUCID,smooth(inv(REVEAL_LOCK,REVEAL_HOLD-0.4,REVEAL_HOLD-S.revealT)));
+  // the shore drives its own camera height, and rises far more slowly than a lie breaks
+  if(S.zt) zt=S.zt;
+  zoom=lerp(zoom,zt,1-Math.exp(-dt*(S.zt?0.46:7)));
+  applyZoom();
+
+  // The distant peak hands off to the real one while the player is mid-chasm,
+  // which can only happen armored — so the swap always sits behind the blinders.
+  const MF=L.markerFade||[1100,1240];
+  S.goalA=lerp(S.goalA,1-inv(MF[0],MF[1],player.x),1-Math.exp(-dt*4));
+
+  /* ---- opening establishing shot: the destination, then the one who must reach it */
+  if(S.intro>0){
+    S.intro-=dt;
+    if(S.intro<=0){ S.intro=0; say(['start','city','vault','shore'][S.levelIdx]); }
+    const el=INTRO_DUR-S.intro;
+    camTarget();
+    const sx=L.goalX-VIEW_W*0.52, sy=terrainYSafe(L.goalX)-VIEW_H*0.46;
+    const k=smooth(inv(INTRO_HOLD,INTRO_DUR,el));
+    cam.x=lerp(sx,cam.tx,k); cam.y=lerp(sy,cam.ty,k);
+    player.tremor=lerp(player.tremor,0.55,1-Math.exp(-dt*2));
+    for(const f of PROPS.flowers) if(f.t>0) f.t=Math.max(0,f.t-dt);
+    S.hintA=lerp(S.hintA,0,1-Math.exp(-dt*6));
+    audioTick(dt); return;
+  }
+
+  /* ---- transitions ---- */
+  if(S.transition){
+    const tr=S.transition; tr.t+=dt;
+    if(tr.t>=tr.dur){
+      if(tr.type==='equip') finishEquip(tr.armor); else finishShatter(tr.soft);
+    }
+    // and the nine storeys fall away underneath the camera as they dissolve
+    camTarget();
+    const ck=1-Math.exp(-dt*(S.opening==='reveal'?4:3));
+    cam.x=lerp(cam.x,cam.tx,ck); cam.y=lerp(cam.y,cam.ty,ck);
+    audioTick(dt); return;
+  }
+
+  if(S.revealT>0) S.revealT=Math.max(0,S.revealT-dt);
+
+  /* ---- falling into the chasm ---- */
+  if(S.falling){
+    S.fallV+=1500*dt; player.y+=S.fallV*dt;
+    S.dread=Math.min(1,S.dread+dt*0.35);
+    if(player.y>1750){ S.fadeTarget=1;
+      if(S.fade>0.97) recover();
+    }
+    S.fade=lerp(S.fade,S.fadeTarget,1-Math.exp(-dt*3.2));
+    camTarget(); cam.y=lerp(cam.y,player.y-VIEW_H*0.5,1-Math.exp(-dt*6));
+    cam.x=lerp(cam.x,cam.tx,1-Math.exp(-dt*3));
+    audioTick(dt); return;
+  }
+  S.fade=lerp(S.fade,S.fadeTarget,1-Math.exp(-dt*3.2));
+  if(S.restarting&&S.fade>0.97){ S.restarting=false; restartLevel(); }
+
+  /* ---- ending ---- */
+  if(S.ended){
+    S.endT+=dt;
+    player.tremor=lerp(player.tremor,0.35,1-Math.exp(-dt*1.2));
+    if(S.endT>8.5){ S.screen='interstitial'; S.interT=0; }
+    camTarget(); cam.x=lerp(cam.x,cam.tx,1-Math.exp(-dt*1.4)); cam.y=lerp(cam.y,cam.ty,1-Math.exp(-dt*1.4));
+    audioTick(dt); return;
+  }
+
+  let dir=moveInput();
+  // for the first seconds on the far side, nothing is asked of you but looking
+  if(S.revealT>REVEAL_HOLD-REVEAL_LOCK) dir=0;
+  if(dir!==0) usedMove=true;
+
+  if(L.shore){
+    /* The last level: no armour to equip, nothing to outrun, and a tempo. */
+    updateShore(dt,dir);
+  } else if(S.mode==='lucid'){
+    S.lucidStreak+=dt;
+    // The lip you are walking toward — where the ground, and the walking, run out.
+    const fwdEdge=regionAt(player.x)[1];
+    const atEdge=Math.abs(player.x-fwdEdge)<200;
+    const onCauseway=L.exposed&&player.x>L.exposed.x0&&player.x<L.exposed.x1;
+
+    if(S.collapsed>0){
+      /* You do not die. You sink to your knees and are, for a while, unable. */
+      S.collapsed-=dt;
+      player.vx=0; player.kneel=lerp(player.kneel,1,1-Math.exp(-dt*4));
+      // you get up with the pressure lower and a little while where it stays there
+      if(S.collapsed<=0){ S.dread=Math.max(0.42,S.floor); S.grace=4.0; }
+    } else {
+      player.kneel=lerp(player.kneel,0,1-Math.exp(-dt*3));
+      // Heavy, high-inertia drag: the character lags well behind your intent.
+      const MAXV=66;
+      const target=dir*MAXV;
+      player.vx+=(target-player.vx)*(1-Math.exp(-dt*1.55));
+      if(Math.abs(player.vx)<0.6&&dir===0) player.vx=0;
+      let nx=player.x+player.vx*dt;
+      const R=regionAt(player.x);
+      if(nx<R[0]){nx=R[0];player.vx=0;}
+      if(nx>R[1]){nx=R[1];player.vx=0;}
+      // you can walk out onto the causeway. You cannot make yourself keep walking.
+      if(L.exposed&&S.dread>0.82&&nx>player.x&&nx>L.exposed.x0){ nx=player.x; player.vx=0; }
+      player.x=nx; player.y=terrainYSafe(player.x);
+      if(dir!==0) player.facing=Math.sign(dir);
+
+      /* --- the Existential Dread meter ---
+         Walking is the one thing that helps: keep moving over ground that will
+         hold you and the pressure eases a little. Stand still, or stand at the
+         lip of the drop, and it comes straight back. */
+      const moving=Math.abs(player.vx)>6;
+      // and the worse it has got, the more walking away from it is worth
+      let rate=moving?-(0.010+0.060*S.dread):0.070;
+      // — for a while. Nobody stays out here indefinitely.
+      S.exposure+=dt;
+      rate+=EXPOSE_RATE*Math.min(1,S.exposure/EXPOSE_FULL);
+      // standing at the lip of the abyss, or under the open sky, is worse
+      rate+=0.085*(1-inv(0,260,Math.abs(player.x-fwdEdge)))*(moving?0.4:1);
+      // out on the open causeway, with no one, it comes on far faster
+      if(onCauseway) rate+=0.34;
+      // the minute after a collapse is numb: nothing reaches you for a while
+      if(S.grace>0){ S.grace-=dt; rate=Math.min(rate,-0.035); }
+      // walking keeps it at bay. It does not take it away.
+      if(rate<0&&S.dread<=S.floor) rate=0;
+      // Choosing a lie is not yet living one, so the gauge waits while the
+      // wheel is open. And out on the causeway the body refuses to go further
+      // rather than dropping you where you stand, over and over.
+      if(!S.wheelOpen) S.dread=clamp(S.dread+rate*dt,0,onCauseway?0.88:1);
+      // going down is the release: the clock on being out here starts over
+      if(S.dread>=1){ S.collapsed=COLLAPSE_DUR; S.everDown=true; S.exposure=0;
+                      SFX.collapse(); vibrate([300]); }
+    }
+
+    player.tremor=lerp(player.tremor,0.55+S.dread*1.35,1-Math.exp(-dt*2.2));
+
+    /* Arriving on your own feet. No armour carries you the whole way on any of
+       these levels, and the last stretch is always walkable — so the ending you
+       are given is the one the last level is about, three levels early. */
+    if(player.x>L.goalX-40&&!S.ended&&!S.transition&&!S.falling&&standable(player.x)){
+      S.reachT=(S.reachT||0)+dt;
+      if(S.reachT>1.0){
+        S.ended=true; S.endT=0; S.dread=0; S.grace=0;
+        SFX.dissolve(); vibrate([10,60,10]);
+        say(['done','cityDone','vaultDone'][S.levelIdx]);
+      }
+    }
+
+    /* --- narrative beats --- */
+    if(S.levelIdx===0&&player.x>430) say('chasm');
+    // the walk, marked out but not interrupted
+    if(S.levelIdx===0&&S.openDone){
+      if(player.x>3000) say('walk1');
+      if(player.x>6000) say('walk2');
+      if(player.x>9000) say('walk3');
+      if(player.x>12000) say('walk4');
+      if(player.x>15000) say('walk5');
+      if(player.x>17800) say('walk6');
+    }
+    /* The second illusion is not offered while there is still ground. It is
+       offered at the lip, where the walking stops working — which is the only
+       honest moment to offer anybody one. */
+    if(S.shattered>=1&&S.revealT<=0&&S.lucidStreak>3.0&&(atEdge||onCauseway)&&!S.unlocked.has(L.armors[1])){
+      S.unlocked.add(L.armors[1]); say('naked');
+    }
+    // contextual hint — silent while collapsed, when no advice applies
+    let h='';
+    if(S.collapsed>0) h='';
+    else if(S.revealT>REVEAL_HOLD-REVEAL_LOCK) h='';   // you are looking, not playing
+    else if(!usedMove) h=IS_TOUCH?'Drag to move':'Drag, or ← →, to move';
+    // out on the open, the advice is not "try harder"
+    else if(onCauseway&&S.dread>0.5) h=IS_TOUCH?'Not this part alone · hold two thumbs':'Not this part alone · hold SPACE';
+    else if(atEdge&&(S.dread>0.30||S.deadEndSeen||S.everDown)&&!usedWheel) h=IS_TOUCH?'Hold two thumbs to focus':'Hold SPACE to focus';
+    else if(S.shattered>=1&&S.unlocked.has(L.armors[1])) h=IS_TOUCH?'Hold two thumbs to focus':'Hold SPACE to focus';
+    S.hint=h; S.hintA=lerp(S.hintA,h?1:0,1-Math.exp(-dt*3));
+
+  } else {
+    /* --------------------------------------------------------- armoured */
+    // A working illusion holds the dread off entirely. One that has run out of
+    // track stops working — and the pressure comes back while you stand in it.
+    if(S.stranded){
+      S.strandT+=dt;
+      S.dread=clamp(S.dread+dt*(0.055+Math.min(S.strandT,20)*0.004),0,1);
+      if(S.dread>=1&&!S.transition){ S.pendingCollapse=true; shatter(false); }
+    } else {
+      S.dread=Math.max(0,S.dread-dt*0.55);
+    }
+    player.tremor=lerp(player.tremor,S.stranded?Math.min(0.5,S.strandT*0.06):0,1-Math.exp(-dt*(S.stranded?2:14)));
+    S.lucidStreak=0;
+
+    if(S.armor==='climb'){
+      /* --- the jumping game, on a clock --- */
+      const C=S.course;
+      S.armT-=dt;
+      if(S.armT<=0) armorFails();
+      else if(C&&C.length){
+        if(keys.has('arrowup')||keys.has('w')||keys.has(' ')) S.jbuf=BUFFER;
+        const prevY=player.y;
+        // a rung that will not hold still takes you with it while you stand on it
+        if(S.onPlat&&S.onPlat.drift){
+          const nx=platX(S.onPlat);
+          if(S.platX!==undefined) player.x+=nx-S.platX;
+          S.platX=nx;
+        }
+        player.vx+=(dir*RUN-player.vx)*(1-Math.exp(-dt*(S.onPlat?18:8)));
+        player.vy+=GRAV*dt;
+        player.x+=player.vx*dt; player.y+=player.vy*dt;
+        // one-way rungs: you land on them, you do not bump into them
+        let landed=null;
+        if(player.vy>=0) for(const p of C){
+          if(prevY<=p.y+2&&player.y>=p.y&&Math.abs(player.x-platX(p))<p.w/2+5){ landed=p; break; }
+        }
+        if(landed){
+          if(!S.onPlat&&player.vy>200) SFX.wood();
+          player.y=landed.y; player.vy=0; S.onPlat=landed; S.platX=platX(landed);
+          S.coyote=COYOTE; S.baseY=landed.y;
+          say('grid',P.climb.cyan);
+        } else { S.onPlat=null; S.coyote=Math.max(0,S.coyote-dt); }
+        S.jbuf=Math.max(0,S.jbuf-dt);
+        if(S.jbuf>0&&S.coyote>0){
+          player.vy=JUMP_V; S.jbuf=0; S.coyote=0; S.onPlat=null; SFX.snap(); vibrate(8);
+        }
+        // arrived: the illusion sets you down on real ground and goes quietly
+        if(landed&&landed.exit&&!S.transition){
+          S.reachT=(S.reachT||0)+dt;
+          if(S.reachT>0.18) armorArrives(C.goal);
+        } else if(!landed||!landed.exit) S.reachT=0;
+        // Falling only drops you a storey. The cut line coming up underneath is
+        // what makes that matter: there is no storey low enough to wait on.
+        C.floor=climbFloor();
+        if(player.y>C.floor) armorFails();
+      }
+      // arriving clears the advice; do not put it straight back on the same frame
+      if(!S.transition){
+        const showFor=(S.opening==='ladder'&&S.openTry===0)?7:4;
+        S.hint=(S.armT<S.armTMax-showFor)?'':(IS_TOUCH?'Drag to move  ·  tap to jump':'← →  move   ·   SPACE  jump');
+        S.hintA=lerp(S.hintA,S.hint?1:0,1-Math.exp(-dt*3));
+      }
+    }
+
+    if(S.armor==='routine'){
+      S.armT-=dt;
+      if(S.armT<=0) armorFails();
+      // the beat runs whether or not you are keeping it, and it speeds up
+      S.beatDur=lerp(BEAT_SLOW,BEAT_FAST,1-S.routineLeft/STAIR_STEPS);
+      S.beatT-=dt;
+      if(S.beatT<=0){ S.beatT+=S.beatDur; if(AU.on&&!S.routineEnd) SFX.tick(true); }
+      S.beatHit=Math.max(0,S.beatHit-dt*3);
+      S.stepLock=Math.max(0,S.stepLock-dt);
+      S.stepAnim=Math.min(1,S.stepAnim+dt/Math.max(0.10,S.beatDur*0.45));
+      const pressed=keys.has('arrowup')||keys.has('w')||keys.has(' ')||
+                    keys.has('arrowright')||keys.has('d');
+      if(pressed&&!S.beatHeld){ S.beatHeld=true; routineStep(); }
+      if(!pressed) S.beatHeld=false;
+      if(S.routineEnd){
+        S.hint=IS_TOUCH?'The mornings run out here · double-tap to step off':'The mornings run out · ESC to step off';
+        S.hintA=lerp(S.hintA,1,1-Math.exp(-dt*4));
+      } else {
+        S.hint=IS_TOUCH?'Tap on the beat  ·  double-tap to step off':'Step on the beat  ·  ESC to step off';
+        S.hintA=lerp(S.hintA,usedMove?0.45:1,1-Math.exp(-dt*3));
+      }
+    }
+
+    /* ------------------------------------------------------- THE DOGMA */
+    if(S.armor==='dogma'){
+      const T=S.dogmaTrack;
+      S.armT-=dt;
+      S.dogFlash=Math.max(0,S.dogFlash-dt*3.2);
+      S.dogSwing=Math.max(0,S.dogSwing-dt*5);
+      if(S.armT<=0&&!S.stranded) armorFails();
+      else if(!S.stranded){
+        if(S.dogStall>0){ S.dogStall-=dt; S.dogV=0; }
+        else { S.dogV=Math.min(DOG_VMAX,S.dogV+DOG_ACC*dt); player.x+=S.dogV*dt; }
+        player.y=terrainYSafe(player.x); player.facing=1;
+        if(S.dogSwingReq){
+          S.dogSwingReq=false;
+          if(S.dogStall<=0){
+            S.dogSwing=1;
+            let hit=null;
+            for(const o of T) if(!o.dead&&o.x>player.x-40&&o.x-player.x<DOG_WIN){ hit=o; break; }
+            if(hit){
+              hit.dead=true; S.cleared.add(hit.x); computeRegions();
+              S.dogHits++; S.dogV=Math.min(DOG_VMAX,S.dogV+DOG_GAIN);
+              S.dogFlash=1; SFX.smash(true); vibrate(16);
+              say('dogmaRun',ARMORS.dogma.key);
+            } else {
+              // swinging at nothing is the one thing that slows a cause down
+              S.dogV=Math.max(DOG_FLOOR,S.dogV-DOG_WHIFF); SFX.tick(false); vibrate(5);
+            }
+          }
+        }
+        // and what you did not clear in time, you go into
+        for(const o of T) if(!o.dead&&player.x>=o.x-10){
+          o.dead=true; S.cleared.add(o.x); computeRegions();
+          S.dogSlams++; S.dogStall=DOG_STALL; S.dogV=0; player.x=o.x-16;
+          S.ceilingFlash=1; S.dread=Math.min(1,S.dread+0.06);
+          SFX.smash(false); vibrate([40,50,40]); break;
+        }
+        /* The road runs out where the crowd does. Out on the open there is
+           nothing to be against, and a cause with nothing to be against has
+           nowhere to put itself. */
+        if(player.x>=S.dogEnd-30){
+          player.x=S.dogEnd-30; S.dogV=0;
+          S.stranded=true; S.ceilingFlash=1; SFX.smash(true);
+          say('dogmaWall',ARMORS.dogma.key); vibrate([8,40,8]);
+        }
+      }
+      if(S.stranded){
+        S.hint=IS_TOUCH?'Double-tap to strip away':'Double-click, or ESC, to strip away';
+        S.hintA=lerp(S.hintA,1,1-Math.exp(-dt*4));
+      } else {
+        S.hint=(S.armT<S.armTMax-5)?'':(IS_TOUCH?'Tap to smash what is in the way':'SPACE, or →, to smash what is in the way');
+        S.hintA=lerp(S.hintA,S.hint?1:0,1-Math.exp(-dt*3));
+      }
+    }
+
+    /* ------------------------------------------------------ THE REFUGE */
+    if(S.armor==='refuge'){
+      const C=S.companion;
+      /* It walks at its own speed. Sometimes that is faster than you want to
+         go and sometimes it stops for no reason you are given, and neither of
+         those is something you get a say in. */
+      if(C&&!C.gone){
+        C.life-=dt;
+        C.vx=clamp(58+48*Math.sin(S.t*0.51+C.ph)+31*Math.sin(S.t*1.27+C.ph*1.7)
+                     +19*Math.sin(S.t*2.90+C.ph*0.4),-14,126);
+        C.x+=C.vx*dt;
+        const CR=regionAt(C.x);
+        if(C.x>CR[1]-24){ C.x=CR[1]-24; C.vx=0; }
+        if(C.x<CR[0]+24){ C.x=CR[0]+24; C.vx=0; }
+        C.y=terrainYSafe(C.x);
+        if(C.life<=0){ C.gone=true; S.stranded=true; SFX.lifespan(); vibrate([120]); }
+      }
+      player.vx+=(dir*REFUGE_V-player.vx)*(1-Math.exp(-dt*3.6));
+      let nx=player.x+player.vx*dt;
+      const R=regionAt(player.x);
+      if(nx<R[0]){nx=R[0];player.vx=0;}
+      if(nx>R[1]){nx=R[1];player.vx=0;}
+      player.x=nx; player.y=terrainYSafe(player.x);
+      if(dir!==0) player.facing=Math.sign(dir);
+
+      const ring=refugeRing();
+      S.refugeD=(C&&!C.gone)?Math.abs(player.x-C.x):1e9;
+      const near=S.refugeD<ring;
+      S.refugeNear=near;
+      // the thread. It is not shown as a number, only as the line going thin.
+      if(!S.stranded){
+        if(near) S.thread=Math.min(REFUGE_SLACK,S.thread+dt*0.75);
+        else {
+          S.thread-=dt;
+          if(S.thread<=0&&C&&!C.gone){
+            C.gone=true; S.stranded=true; S.ceilingFlash=1;
+            SFX.lifespan(); vibrate([120]);
+          }
+        }
+      }
+      if(C&&C.gone){
+        S.hint=IS_TOUCH?'Double-tap to strip away':'Double-click, or ESC, to strip away';
+        S.hintA=lerp(S.hintA,1,1-Math.exp(-dt*4));
+      } else {
+        S.hint=near?'Stay inside it':'Get back';
+        S.hintA=lerp(S.hintA,near?(usedMove?0.26:1):1,1-Math.exp(-dt*4));
+      }
+      if(player.x>L.goalX-40&&!S.ended&&!S.transition){
+        S.reachT=(S.reachT||0)+dt; if(S.reachT>0.8) shatter(true);
+      }
+    }
+
+    /* ---------------------------------------------------- THE CREATION */
+    if(S.armor==='creation'){
+      const ay=moveInputY();
+      S.paintAng=lerp(S.paintAng,ay*CREATE_ANG,1-Math.exp(-dt*7));
+      const drawing=(dir>0.2)&&S.paint>0&&!S.stranded;
+      // you ride the end of your own line, and it only goes one way
+      if(drawing){
+        const stepL=CREATE_V*dt;
+        const nx=player.x+Math.cos(S.paintAng)*stepL;
+        const ny=player.y+Math.sin(S.paintAng)*stepL;
+        const gy=terrainY(nx);
+        const onLedge=(gy!==null)&&standable(nx)&&Math.abs(ny-gy)<=CLIMB_LAND;
+        if(gy!==null&&!onLedge&&ny>gy){
+          // the far wall, met somewhere below the top of it
+          player.vx=0;
+        } else {
+          S.paint=Math.max(0,S.paint-stepL);
+          player.x=nx; player.y=onLedge?gy:ny;
+          S.trail.push({x:player.x,y:player.y,age:0});
+          if(S.trail.length>1400) S.trail.shift();
+        }
+      }
+      for(const t of S.trail) t.age+=dt;
+      // the end of the line is the only part of it you can be standing on
+      const tip=S.trail.length?S.trail[S.trail.length-1]:null;
+      const onReal=(()=>{ const gy=terrainY(player.x);
+        return gy!==null&&standable(player.x)&&Math.abs(player.y-gy)<=CLIMB_LAND; })();
+      if(!onReal&&tip&&tip.age>=PAINT_DRY&&!S.falling){
+        S.falling=true; S.fallV=0; S.ceilingFlash=1;
+      }
+      if(S.paint<=0&&!S.stranded&&onReal) S.stranded=true;
+      // and if it did reach, it goes quietly and leaves you standing on stone
+      if(onReal&&player.x>=S.paintGoal-24&&!S.transition&&!S.ended){
+        S.paintLand+=dt; if(S.paintLand>0.5) shatter(true);
+      } else S.paintLand=0;
+      S.hint=S.paint<=0
+        ? (IS_TOUCH?'Out of paint · double-tap to strip away':'Out of paint · ESC to strip away')
+        : (IS_TOUCH?'Drag forward to draw  ·  up and down to aim it':'Hold → to draw  ·  ↑ ↓ to aim it');
+      S.hintA=lerp(S.hintA,(S.paint<=0||!usedMove)?1:0.42,1-Math.exp(-dt*3));
+    }
+
+    /* ----------------------------------------------------- THE ARCHIVE */
+    if(S.armor==='archive'){
+      const AT=S.archTrack;
+      const at=S.archTrack[S.archIdx];
+      S.armT-=dt;
+      // running out while standing on stone is arriving, not breaking
+      if(S.armT<=0&&!S.transition){ if(at&&at.ground) shatter(true); else if(!S.archUndef) armorFails(); }
+      else if(S.archDash){
+        // the arc it computed, walked exactly. It is never wrong about this.
+        const d=S.archDash; d.t+=dt;
+        const k=Math.min(1,d.t/d.dur), tt=k*d.tof;
+        player.x=d.from.x+Math.cos(d.ang)*ARCH_V*tt;
+        player.y=d.from.y-Math.sin(d.ang)*ARCH_V*tt+0.5*ARCH_G*tt*tt;
+        if(k>=1){ S.archDash=null; player.x=d.to.x; player.y=d.to.y; }
+      } else if(!S.archUndef){
+        // the aim sweeps, and every mistake makes it sweep faster
+        const sp=ARCH_SWEEP+S.archErr*ARCH_SWEEP_ERR;
+        S.archAng+=S.archDir*sp*dt;
+        if(S.archAng>=ARCH_HI){ S.archAng=ARCH_HI; S.archDir=-1; }
+        if(S.archAng<=ARCH_LO){ S.archAng=ARCH_LO; S.archDir=1; }
+      }
+      /* It sets you down on stone and then, without comment, offers one more.
+         Almost everybody tries it. That is the point of putting it there. */
+      if(S.archUndef){
+        S.hint=IS_TOUCH?'Double-tap to strip away':'Double-click, or ESC, to strip away';
+        S.hintA=lerp(S.hintA,1,1-Math.exp(-dt*4));
+      } else if(at&&at.ground){
+        S.hint=IS_TOUCH?'Stone · double-tap to step off':'Stone · ESC to step off';
+        S.hintA=lerp(S.hintA,1,1-Math.exp(-dt*4));
+      } else {
+        S.hint=(S.armT<S.armTMax-6)?'':(IS_TOUCH?'Tap when the angle is right':'SPACE, or →, when the angle is right');
+        S.hintA=lerp(S.hintA,S.hint?1:0,1-Math.exp(-dt*3));
+      }
+    }
+  }
+
+  // the last ground that would have held you, remembered for when a lie gives way
+  if(!S.falling&&terrainY(player.x)!==null&&standable(player.x)) player.safe=player.x;
+
+  camTarget();
+  const k=1-Math.exp(-dt*(S.mode==='armored'?6.5:(S.revealT>0?1.15:(S.camK||2.4))));
+  cam.x=lerp(cam.x,cam.tx,k); cam.y=lerp(cam.y,cam.ty,k);
+
+  // decay: blossoms in real time, stone in years, cities in centuries
+  for(const f of PROPS.flowers) if(f.t>0) f.t=Math.max(0,f.t-dt);
+  for(const r of PROPS.ruins) r.yrs=Math.max(0,r.yrs-dt*0.5);
+  if(PROPS.towers) for(const t of PROPS.towers) t.yrs=Math.max(0,t.yrs-dt*0.35);
+  if(PROPS.statues) for(const t of PROPS.statues) t.yrs=Math.max(0,t.yrs-dt*0.4);
+
+  audioTick(dt);
+}
+
+/* ============================================================== DRAWING === */
+function wx(x,p){ return x-cam.x*p; }
+function wy(y,p){ return y-cam.y*p; }
+
+/* -------------------------------------------------------- the raw world -- */
+function drawRaw(opt){
+  opt=opt||{};
+  const sun=S.sunT;
+  const PT=L.paint;
+  const g=ctx.createLinearGradient(0,0,0,VIEW_H);
+  // twilight sinking towards night as the session runs
+  g.addColorStop(0.00, mixHex(PT.skyTop,PT.night,sun));
+  g.addColorStop(0.34, mixHex(PT.skyMid,PT.night,sun));
+  g.addColorStop(0.66, mixHex(PT.skyLow,PT.skyMid,sun*0.85));
+  g.addColorStop(0.84, mixHex(PT.skyDusk,'#57414a',sun));
+  g.addColorStop(1.00, mixHex(PT.skyFloor,'#3a3038',sun));
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+
+  /* stars — on the shore the sky is already full of them, and stays that way
+     however far the camera climbs, so the field is spread across the sky that
+     is actually in view rather than sitting in a fixed band of the world */
+  const starA=L.shore?0.95:smooth(inv(0.35,1,sun))*0.9;
+  if(starA>0.01){
+    if(L.shore) eachShoreStar((px,py,tw,r)=>{
+      ctx.fillStyle=hex(L.paint.star,starA*tw*0.85);
+      ctx.beginPath(); ctx.arc(px,py,r,0,6.283); ctx.fill();
+    });
+    else for(const s of stars){
+      const px=wx(s.x,0.02)%(VIEW_W+400), py=wy(s.y,0.02);
+      const tw=0.55+0.45*Math.sin(S.t*1.4+s.tw);
+      ctx.fillStyle=hex(L.paint.star,starA*tw*0.85);
+      ctx.beginPath(); ctx.arc((px+VIEW_W+400)%(VIEW_W+400)-200,py,s.r,0,6.283); ctx.fill();
+    }
+  }
+
+  /* the sun, sinking. The shore has no sun: it is lit by the thing it is
+     walking towards, which is not a sun and is not going anywhere. */
+  if(!L.shore){
+    const sunX=wx(1750,0.03), sunY=wy(lerp(250,700,easeInCubic(sun)),0.03);
+    const glow=ctx.createRadialGradient(sunX,sunY,0,sunX,sunY,460);
+    glow.addColorStop(0,hex(PT.skyFloor,0.42*(1-sun*0.6)));
+    glow.addColorStop(0.25,hex(PT.skyDusk,0.22*(1-sun*0.6)));
+    glow.addColorStop(1,hex(PT.skyDusk,0));
+    ctx.fillStyle=glow; ctx.fillRect(sunX-460,sunY-460,920,920);
+    ctx.fillStyle=hex(PT.skyFloor,0.85*(1-sun*0.75));
+    ctx.beginPath(); ctx.arc(sunX,sunY,34,0,6.283); ctx.fill();
+  }
+
+  /* clouds */
+  for(const c of clouds){
+    const px=((c.x+S.t*c.v)-cam.x*0.08)%(5400)-1200, py=wy(c.y,0.08);
+    ctx.fillStyle=hex(mixHex(PT.skyDusk,PT.skyMid,sun),c.a*(1-sun*0.4));
+    ctx.beginPath(); ctx.ellipse(px,py,c.w/2,c.h/2,0,0,6.283); ctx.fill();
+  }
+
+  // A peak far enough off to be the last thing in the picture goes in first, so
+  // the nearer ridges cut its base off the way distance actually does.
+  if(L.marker&&L.marker.behind) drawGoalMarker(sun);
+
+  /* parallax ridgelines */
+  for(const LR of L.ridges){
+    ctx.beginPath();
+    let started=false;
+    for(const pt of LR.pts){
+      const px=wx(pt[0],LR.p), py=wy(pt[1],LR.p);
+      if(px<-300) continue;
+      if(px>VIEW_W+300&&started) break;
+      if(!started){ ctx.moveTo(px,py); started=true; } else ctx.lineTo(px,py);
+    }
+    ctx.lineTo(VIEW_W+400,VIEW_H+600); ctx.lineTo(-400,VIEW_H+600); ctx.closePath();
+    ctx.fillStyle=mixHex(LR.c,L.paint.night,sun*0.55); ctx.fill();
+    // atmospheric haze on the far layers
+    if(LR.haze>0.05){
+      const hg=ctx.createLinearGradient(0,wy(0,LR.p),0,wy(900,LR.p));
+      hg.addColorStop(0,hex(L.paint.haze,0)); hg.addColorStop(1,hex(L.paint.haze,LR.haze*0.16*(1-sun*0.7)));
+      ctx.fillStyle=hg; ctx.fill();
+    }
+  }
+
+  if(!(L.marker&&L.marker.behind)) drawGoalMarker(sun);
+  drawTowers(sun);
+  drawChasm(sun);
+  if(L.shore){ drawWater(); drawShoreLight(); drawMonolith(); }
+  else { drawGround(sun); drawSpire(sun); }
+  drawStatues(sun);
+  drawCrowd(sun);
+  drawRubble(sun);
+  drawRuins(sun);
+  drawGrass(sun);
+  drawFlowers(sun);
+  drawMotes();
+  drawPlayerRaw();
+
+  /* the only HUD in Lucidity: the screen itself closing in */
+  drawDreadVignette();
+  // and, at the very end, the opposite of that
+  if(S.light>0.001){ ctx.fillStyle=hex('#EAF3FF',S.light*0.12); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+
+  if(opt.desat>0.001){
+    ctx.save(); ctx.globalCompositeOperation='saturation';
+    ctx.globalAlpha=clamp(opt.desat,0,1); ctx.fillStyle='hsl(0,0%,50%)';
+    ctx.fillRect(0,0,VIEW_W,VIEW_H); ctx.restore();
+  }
+  if(opt.blur>0.4&&ctx.filter!==undefined){
+    ctx.save(); ctx.filter=`blur(${opt.blur.toFixed(1)}px)`;
+    ctx.drawImage(cv,0,0,VIEW_W,VIEW_H); ctx.filter='none'; ctx.restore();
+  }
+  if(opt.dark>0.001){ ctx.fillStyle=hex('#000000',clamp(opt.dark,0,1)); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+}
+
+function mixHex(a,b,t){
+  t=clamp(t,0,1);
+  const na=parseInt(a.slice(1),16), nb=parseInt(b.slice(1),16);
+  const r=Math.round(lerp((na>>16)&255,(nb>>16)&255,t));
+  const g=Math.round(lerp((na>>8)&255,(nb>>8)&255,t));
+  const bl=Math.round(lerp(na&255,nb&255,t));
+  return `rgb(${r},${g},${bl})`;
+}
+
+function drawChasm(sun){ for(const gap of L.gaps) drawGap(sun,gap); }
+function drawGap(sun,gap){
+  const x0=wx(gap.x0,1), x1=wx(gap.x1,1);
+  if(x1<-100||x0>VIEW_W+100) return;
+  const yTop=wy(Math.min(terrainYRaw(gap.x0),terrainYRaw(gap.x1))-6,1);
+  const g=ctx.createLinearGradient(0,yTop,0,yTop+900);
+  g.addColorStop(0,hex('#131c22',0)); g.addColorStop(0.12,hex('#131c22',0.5));
+  g.addColorStop(0.4,'rgba(6,9,12,0.94)'); g.addColorStop(1,'#04070a');
+  ctx.fillStyle=g; ctx.fillRect(x0-20,yTop,x1-x0+40,VIEW_H+900);
+  // mist drifting in the throat of the gap
+  for(let i=0;i<5;i++){
+    const yy=yTop+120+i*95+Math.sin(S.t*0.18+i)*16;
+    ctx.fillStyle=hex(L.paint.haze,0.030+0.014*Math.sin(S.t*0.25+i*1.7));
+    ctx.beginPath(); ctx.ellipse((x0+x1)/2+Math.sin(S.t*0.11+i*2)*70,yy,(x1-x0)*0.62,26,0,0,6.283); ctx.fill();
+  }
+}
+
+function solidRuns(){
+  const T=L.terrain, out=[];
+  let start=T[0][0]-140;
+  const gs=L.gaps.slice().sort((a,b)=>a.x0-b.x0);
+  for(const g of gs){ out.push([start,g.x0]); start=g.x1; }
+  out.push([start,T[T.length-1][0]+140]);
+  return out;
+}
+function drawGround(sun){
+  const rim=mixHex(L.paint.rim,'#5a4a52',sun*0.8);
+  const body=mixHex(L.paint.ground,L.paint.groundNight,sun*0.7);
+  const drawPoly=(from,to)=>{
+    ctx.beginPath();
+    let first=true;
+    for(const p of L.terrain){
+      if(p[0]<from-260||p[0]>to+260) continue;
+      const px=wx(p[0],1), py=wy(p[1],1);
+      if(first){ ctx.moveTo(px,py); first=false; } else ctx.lineTo(px,py);
+    }
+    ctx.lineTo(wx(to,1),VIEW_H+900); ctx.lineTo(wx(from,1),VIEW_H+900); ctx.closePath();
+  };
+  // one solid mass per run of ground, voids left as voids
+  const runs=solidRuns();
+  ctx.fillStyle=body;
+  for(const r of runs){ drawPoly(r[0],r[1]); ctx.fill(); }
+  // sunlit rim along the top edge
+  ctx.lineWidth=2.4; ctx.strokeStyle=hex(L.paint.rim,0.5*(1-sun*0.55));
+  const strokeEdge=(from,to)=>{
+    ctx.beginPath(); let first=true;
+    for(const p of L.terrain){
+      if(p[0]<from-260||p[0]>to+260) continue;
+      const px=wx(p[0],1), py=wy(p[1],1);
+      if(first){ctx.moveTo(px,py);first=false;} else ctx.lineTo(px,py);
+    }
+    ctx.stroke();
+  };
+  for(const r of runs) strokeEdge(r[0],r[1]);
+  ctx.strokeStyle=hex(rim,0.22); ctx.lineWidth=1;
+  // rock speckle
+  const r2=mulberry32(7);
+  ctx.fillStyle=hex(L.paint.rim,0.05);
+  for(let i=0;i<420;i++){
+    const x=lerp(-1600,3400,r2()), ty=terrainY(x);
+    if(ty===null) continue;
+    const px=wx(x,1), py=wy(ty+r2()*260+8,1);
+    if(px<-40||px>VIEW_W+40) continue;
+    ctx.fillRect(px,py,1.6,1.6);
+  }
+}
+
+function drawRuins(sun){
+  for(const r of PROPS.ruins){
+    const gy=terrainYSafe(r.x), px=wx(r.x,1), py=wy(gy,1);
+    if(px<-320||px>VIEW_W+320) continue;
+    ctx.fillStyle=mixHex('#2c3a41','#0d141a',sun*0.7);
+    if(r.kind==='pillar'){
+      ctx.beginPath();
+      ctx.moveTo(px-r.w/2,py); ctx.lineTo(px-r.w/2+3,py-r.h);
+      ctx.lineTo(px+r.w/2-6,py-r.h+9); ctx.lineTo(px+r.w/2,py); ctx.closePath(); ctx.fill();
+      ctx.fillStyle=hex(L.paint.rim,0.10*(1-sun*0.6));
+      ctx.fillRect(px-r.w/2,py-r.h,3,r.h);
+    } else {
+      ctx.fillRect(px-r.w/2,py-r.h,15,r.h);
+      ctx.fillRect(px+r.w/2-15,py-r.h,15,r.h);
+      ctx.beginPath(); ctx.moveTo(px-r.w/2,py-r.h);
+      ctx.quadraticCurveTo(px,py-r.h-44,px+r.w/2,py-r.h);
+      ctx.lineTo(px+r.w/2-15,py-r.h); ctx.quadraticCurveTo(px,py-r.h-24,px-r.w/2+15,py-r.h);
+      ctx.closePath(); ctx.fill();
+    }
+    // "years until forgotten" — the raw world shows you every clock
+    const ty=py-r.h-58;
+    setFont(ctx,400,11,MONO,'0.14em');
+    ctx.textAlign='center';
+    ctx.fillStyle=hex('#CBD5E1',0.30);
+    ctx.fillText(`${r.kind.toUpperCase()} · ${Math.round(r.yrs).toLocaleString()} YRS`,px,ty);
+    clearSpace(ctx);
+  }
+}
+
+/* The destination. A solitary spire on the far peak — the one thing in the raw
+   world that is neither decaying nor counting down. */
+function drawSpire(sun){
+  const bx=wx(L.goalX,1), by=wy(terrainYSafe(L.goalX),1);
+  if(bx<-260||bx>VIEW_W+260) return;
+  const H=182, W=26;
+  const beat=0.5+0.5*Math.sin(S.t*0.85);
+
+  ctx.fillStyle=mixHex(L.ridges[0].c,L.paint.night,sun*0.5);
+  if(L.id===2){            // a gate out of the city: two piers and a lintel
+    ctx.fillRect(bx-52,by-H*0.86,20,H*0.86);
+    ctx.fillRect(bx+32,by-H*0.86,20,H*0.86);
+    ctx.fillRect(bx-58,by-H*0.94,116,22);
+  } else if(L.id===3){     // the vault's last threshold, open onto nothing
+    ctx.fillRect(bx-46,by-H*0.80,14,H*0.80);
+    ctx.fillRect(bx+32,by-H*0.80,14,H*0.80);
+    ctx.beginPath(); ctx.moveTo(bx-46,by-H*0.80);
+    ctx.quadraticCurveTo(bx,by-H*1.06,bx+46,by-H*0.80);
+    ctx.lineTo(bx+32,by-H*0.80); ctx.quadraticCurveTo(bx,by-H*0.96,bx-32,by-H*0.80);
+    ctx.closePath(); ctx.fill();
+  } else {                 // a solitary spire on the far peak
+  ctx.beginPath();
+  ctx.moveTo(bx-W/2,by); ctx.lineTo(bx-W*0.30,by-H*0.72);
+  ctx.lineTo(bx,by-H); ctx.lineTo(bx+W*0.30,by-H*0.72);
+  ctx.lineTo(bx+W/2,by); ctx.closePath(); ctx.fill();
+  }
+  // sunward rim, so it reads as stone rather than a cut-out
+  if(L.id===1){
+    ctx.strokeStyle=hex(L.paint.rim,0.34*(1-sun*0.5)); ctx.lineWidth=1.6;
+    ctx.beginPath(); ctx.moveTo(bx+W/2,by); ctx.lineTo(bx+W*0.30,by-H*0.72); ctx.lineTo(bx,by-H); ctx.stroke();
+  }
+
+  const gy=by-H-8;
+  const g=ctx.createRadialGradient(bx,gy,0,bx,gy,92+beat*16);
+  g.addColorStop(0,hex(L.paint.skyFloor,0.55+beat*0.22));
+  g.addColorStop(0.30,hex(L.paint.rim,0.16+beat*0.07));
+  g.addColorStop(1,hex(L.paint.rim,0));
+  ctx.fillStyle=g; ctx.fillRect(bx-110,gy-110,220,220);
+  ctx.fillStyle=hex('#F8FAFC',0.72+beat*0.24);
+  ctx.beginPath(); ctx.arc(bx,gy,3.4,0,6.283); ctx.fill();
+}
+
+/* The same peak, read from far away. Sits in the distant parallax band so it
+   stays on the horizon for the whole approach; fades out while the player is
+   crossing the chasm behind the blinders, where the swap can't be seen. */
+function drawGoalMarker(sun){
+  const a=S.goalA;
+  if(!L.marker||a<0.01) return;
+  const p=L.marker.p||0.10, px=L.marker.x-cam.x*p, py=wy(L.marker.y,p);
+  if(px<-300||px>VIEW_W+300) return;
+  const beat=0.5+0.5*Math.sin(S.t*0.85);
+  ctx.save(); ctx.globalAlpha=a;
+  // hazier than the ridge in front of it, because everything far away is
+  ctx.fillStyle=mixHex(L.marker.c||L.ridges[0].c,L.paint.night,sun*(L.marker.behind?0.35:0.4));
+  // drawn behind, it runs off the bottom of the picture: distance cuts the base
+  // off a mountain, and a mountain with a visible base is a cut-out
+  const base=L.marker.behind?py+620:py+118;
+  ctx.beginPath();
+  ctx.moveTo(px-190,base); ctx.lineTo(px-74,py+18); ctx.lineTo(px-26,py+44);
+  ctx.lineTo(px,py); ctx.lineTo(px+40,py+50); ctx.lineTo(px+104,py+8);
+  ctx.lineTo(px+210,base); ctx.closePath(); ctx.fill();
+  ctx.fillStyle=mixHex(L.ridges[0].c,L.paint.night,sun*0.2);
+  ctx.fillRect(px-2.6,py-30,5.2,32);
+  const gy=py-32;
+  const g=ctx.createRadialGradient(px,gy,0,px,gy,44+beat*10);
+  g.addColorStop(0,hex(L.paint.skyFloor,0.5+beat*0.24));
+  g.addColorStop(1,hex(L.paint.skyDusk,0));
+  ctx.fillStyle=g; ctx.fillRect(px-58,gy-58,116,116);
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------- the shore -
+   One flat plane of water, and everything above it happening twice. There is
+   nothing to climb, nothing decaying, and nothing counting down. */
+const horizonY=()=>wy(L.water,1);
+// Gradients here are defined in user space and reach far past the frame, so the
+// rectangles they are painted through stay clamped to what can actually be seen.
+const clipWater=hy=>{ ctx.beginPath(); ctx.rect(-300,hy,VIEW_W+600,VIEW_H-hy+400); ctx.clip(); };
+const fillSeen=()=>ctx.fillRect(-300,-300,VIEW_W+600,VIEW_H+600);
+
+/* The star field, spread across whatever sky is currently in frame. The camera
+   ends this level a mile up, and an endless sky has to stay endless. */
+function eachShoreStar(fn){
+  const hy=horizonY(), span=VIEW_W+400;
+  for(const s of stars){
+    const px=((wx(s.x*2.4,0.02)%span)+span)%span-200;
+    const py=lerp(-VIEW_H*0.06,hy-6,(s.y+40)/460);
+    if(py>hy-4) continue;
+    // sized in screen pixels: a star does not get smaller because you climbed
+    fn(px,py,0.55+0.45*Math.sin(S.t*1.4+s.tw),us(s.r*0.95));
+  }
+}
+
+function drawWater(){
+  const hy=horizonY(), PT=L.paint;
+  const g=ctx.createLinearGradient(0,hy,0,VIEW_H+600);
+  g.addColorStop(0,mixHex(PT.skyDusk,PT.ground,0.42));
+  g.addColorStop(0.12,mixHex(PT.ground,PT.night,0.30));
+  g.addColorStop(1,PT.groundNight);
+  ctx.fillStyle=g; ctx.fillRect(-300,hy,VIEW_W+600,VIEW_H-hy+400);
+
+  ctx.save(); clipWater(hy);
+  // the sky again, upside down and never quite still
+  eachShoreStar((px,sy,tw,r)=>{
+    const py=2*hy-sy+Math.sin(px*0.021+S.t*0.6)*us(1.8);
+    if(py<hy+2||py>VIEW_H+60) return;
+    ctx.fillStyle=hex(PT.star,0.32*tw*(1-inv(hy,VIEW_H,py)*0.72));
+    ctx.beginPath(); ctx.arc(px,py,r*0.9,0,6.283); ctx.fill();
+  });
+  // rings, spreading from wherever you last put your weight down
+  if(PROPS.ripples) for(const r of PROPS.ripples){
+    const k=r.t/r.life, px=wx(r.x,1);
+    const rad=lerp(12,lerp(230,540,r.s),easeOutCubic(k));
+    const a=(1-k)*(1-k)*(0.10+0.26*r.s);
+    if(a<0.005||px<-rad-200||px>VIEW_W+rad+200) continue;
+    ctx.strokeStyle=hex(PT.rim,a); ctx.lineWidth=lerp(2.2,0.6,k);
+    ctx.beginPath(); ctx.ellipse(px,hy,rad,rad*0.155,0,0,6.283); ctx.stroke();
+  }
+  ctx.restore();
+
+  // the seam where the two halves of the world meet, held at a constant
+  // thickness on screen however far back the camera goes
+  const sh=us(28);
+  const seam=ctx.createLinearGradient(0,hy-sh,0,hy+sh);
+  seam.addColorStop(0,hex(PT.haze,0));
+  seam.addColorStop(0.5,hex(PT.haze,0.13+S.light*0.26));
+  seam.addColorStop(1,hex(PT.haze,0));
+  ctx.fillStyle=seam; ctx.fillRect(0,hy-sh,VIEW_W,sh*2);
+}
+
+/* The soft light on the horizon: not a sun, not a goal marker counting down.
+   Just somewhere to walk, which turns out to be enough. */
+function drawShoreLight(){
+  const hy=horizonY(), beat=0.5+0.5*Math.sin(S.t*0.5);
+  // A horizon is not a place you can overtake. While there is water left to
+  // cross the light sits far ahead; as you arrive it comes down to meet you.
+  // The establishing shot is the exception: there it is where it says it is.
+  const far=clamp((L.goalX-player.x)/2400,0,1);
+  const px=S.intro>0?wx(L.goalX,1):lerp(wx(player.x,1)+VIEW_W*0.055,VIEW_W*0.80,smooth(far));
+  const R=VIEW_W*lerp(0.13,0.42,S.light)*(1+0.035*beat);
+  const a=0.30+S.light*0.50;
+  const g=ctx.createRadialGradient(px,hy,0,px,hy,R);
+  g.addColorStop(0,hex('#FFFFFF',a));
+  g.addColorStop(0.13,hex(L.paint.skyFloor,a*0.46));
+  g.addColorStop(0.48,hex(L.paint.skyDusk,a*0.15));
+  g.addColorStop(1,hex(L.paint.skyDusk,0));
+  ctx.fillStyle=g; fillSeen();
+
+  // the light it lays across the water: a soft pool with no edges, broken up
+  // by the swell into slow glints
+  ctx.save(); clipWater(hy);
+  const PR=R*1.15;
+  ctx.save(); ctx.translate(px,hy); ctx.scale(1,2.2);
+  const pool=ctx.createRadialGradient(0,0,0,0,0,PR);
+  pool.addColorStop(0,hex('#FFFFFF',0.15+S.light*0.22));
+  pool.addColorStop(0.34,hex('#FFFFFF',0.055+S.light*0.10));
+  pool.addColorStop(1,hex('#FFFFFF',0));
+  ctx.fillStyle=pool; ctx.fillRect(-px-300,0,VIEW_W+600,(VIEW_H-hy+400)/2.2);
+  ctx.restore();
+  // uneven, and soft at both ends, so they read as swell rather than as rungs
+  const bot=VIEW_H+200;
+  for(let i=0;i<12;i++){
+    const j=(Math.sin(i*12.9898)*0.5+0.5);
+    const t=clamp((i+0.35+j*0.55)/12,0,1);
+    const yy=hy+Math.pow(t,1.7)*(bot-hy);
+    const w=lerp(R*0.22,R*1.05,t)*(0.7+0.55*j);
+    const aa=(0.05+S.light*0.07)*(1-t*0.85)*(0.35+0.65*Math.abs(Math.sin(S.t*0.9+i*1.3)));
+    const gx=px+Math.sin(S.t*0.6+i*0.8)*w*0.10;
+    const gg=ctx.createLinearGradient(gx-w/2,0,gx+w/2,0);
+    gg.addColorStop(0,hex('#FFFFFF',0)); gg.addColorStop(0.5,hex('#FFFFFF',aa));
+    gg.addColorStop(1,hex('#FFFFFF',0));
+    ctx.fillStyle=gg; ctx.fillRect(gx-w/2,yy,w,us(2));
+  }
+  ctx.restore();
+}
+
+/* The obsidian mirror. Everything you built to outlive you, playing back on a
+   surface that does not care either way. */
+function drawMonolith(){
+  if(L.monoX===undefined) return;
+  const hy=horizonY(), px=wx(L.monoX,1);
+  if(px<-900||px>VIEW_W+900) return;
+  const gone=S.flood, solid=1-gone;
+  const w=MONO_W, h=MONO_H, top=hy-h, split=easeOutCubic(S.crack)*22;
+  const half=(dir,fn)=>{ ctx.save(); ctx.translate(dir*split,0); fn(); ctx.restore(); };
+  const facePath=(x0,x1)=>{ ctx.beginPath(); ctx.rect(px+x0,top,x1-x0,h); };
+
+  if(solid>0.01){
+    // its reflection first — as tall as the thing itself, and less certain
+    ctx.save(); clipWater(hy); ctx.globalAlpha=0.34*solid;
+    const rg=ctx.createLinearGradient(0,hy,0,hy+h*0.85);
+    rg.addColorStop(0,hex('#0b0b12',0.95)); rg.addColorStop(1,hex('#0b0b12',0));
+    ctx.fillStyle=rg;
+    ctx.fillRect(px-w/2+Math.sin(S.t*0.8)*2,hy,w,h*0.85);
+    ctx.restore();
+
+    ctx.save(); ctx.globalAlpha=solid;
+    for(const d of [-1,1]) half(d,()=>{
+      const x0=d<0?-w/2:0, x1=d<0?0:w/2;
+      facePath(x0,x1);
+      const bg=ctx.createLinearGradient(px,top,px,hy);
+      bg.addColorStop(0,'#07070c'); bg.addColorStop(1,'#0d0d16');
+      ctx.fillStyle=bg; ctx.fill();
+    });
+    // the montage, held inside the stone
+    const mont=clamp(inv(760,300,Math.abs(player.x-L.monoX)),0,1)*solid;
+    if(mont>0.01){
+      ctx.save();
+      facePath(-w/2-split,w/2+split); ctx.clip();
+      const band=h*0.30, total=band*6, scroll=(S.t*13)%total;
+      for(let k=0;k<8;k++){
+        const y=top+h-(((k*band+scroll)%total));
+        const fade=smooth(inv(top-30,top+h*0.22,y))*(1-smooth(inv(top+h*0.74,top+h+30,y)));
+        if(fade>0.01) armorGhost(k%6,px,y,w*0.62,mont*fade*0.55);
+      }
+      ctx.restore();
+    }
+    // the outer edge only — an unbroken wall has no seam down its middle.
+    // Squared, so the structure goes before the light does.
+    ctx.save(); ctx.globalAlpha=solid*solid;
+    ctx.strokeStyle=hex('#CFE3F5',0.20); ctx.lineWidth=1.2;
+    for(const d of [-1,1]) half(d,()=>{
+      const inner=px+(d<0?0:0), outer=px+d*w/2;
+      ctx.beginPath(); ctx.moveTo(inner,top); ctx.lineTo(outer,top);
+      ctx.lineTo(outer,hy); ctx.lineTo(inner,hy); ctx.stroke();
+    });
+    ctx.restore();
+    // The light coming out of the split, opening from the middle outwards —
+    // and then taking the whole wall with it, rather than leaving a pillar.
+    if(S.crack>0.001){
+      const c=smooth(S.crack), y0=top+lerp(h*0.5,0,c), hh=h*lerp(0.02,1,c);
+      ctx.save(); ctx.globalAlpha=solid;
+      ctx.shadowColor='#FFF6CF'; ctx.shadowBlur=34*S.crack;
+      // a hard blade of light while it is still a wall with a split in it
+      if(gone<0.98){
+        const cw=us(2.4)+split*1.8;
+        const cg=ctx.createLinearGradient(0,y0,0,y0+hh);
+        cg.addColorStop(0,hex('#FFF6CF',0.70*S.crack*(1-gone)));
+        cg.addColorStop(0.7,hex('#FFFFFF',0.92*S.crack*(1-gone)));
+        cg.addColorStop(1,hex('#FFFFFF',0.98*S.crack*(1-gone)));
+        ctx.fillStyle=cg; ctx.fillRect(px-cw/2,y0,cw,hh);
+      }
+      // and then no edges at all, because it is not a wall any more
+      if(gone>0.01){
+        ctx.save(); ctx.translate(px,y0+hh*0.58); ctx.scale(1,hh/(w*0.9));
+        const rg=ctx.createRadialGradient(0,0,0,0,0,w*0.9);
+        rg.addColorStop(0,hex('#FFFFFF',0.85*gone));
+        rg.addColorStop(0.42,hex('#FFF6CF',0.42*gone));
+        rg.addColorStop(1,hex('#FFF6CF',0));
+        ctx.fillStyle=rg; ctx.fillRect(-w*0.9,-w*0.9,w*1.8,w*1.8);
+        ctx.restore();
+      }
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  // and then it is not a wall any more: liquid light, spilling over the mirror
+  // and, over the following minute, simply becoming part of the water
+  if(gone>0&&S.act!=='rise'&&S.act!=='epilogue'&&S.act!=='over'){
+    const f=easeOutCubic(gone), R=lerp(80,2600,f);
+    const settle=S.act==='dissolve'?1:clamp(1-S.actT/7,0,1);
+    if(settle>0.002){
+      ctx.save(); clipWater(hy); ctx.globalAlpha=settle;
+      const g=ctx.createRadialGradient(px,hy,0,px,hy,R);
+      g.addColorStop(0,hex('#FFFFFF',0.55*(1-f*0.45)));
+      g.addColorStop(0.20,hex('#FFF6CF',0.30*(1-f*0.5)));
+      g.addColorStop(0.58,hex('#FFD700',0.09*(1-f*0.6)));
+      g.addColorStop(1,hex('#FFD700',0));
+      ctx.fillStyle=g; ctx.fillRect(-300,hy-60,VIEW_W+600,VIEW_H-hy+400);
+      // rings of it going out across the mirror
+      for(let i=0;i<3;i++){
+        const k=clamp(gone*1.7-i*0.3,0,1);
+        if(k<=0.02||k>=1) continue;
+        const rad=lerp(50,1700,easeOutCubic(k));
+        ctx.strokeStyle=hex('#FFF6CF',(1-k)*0.45); ctx.lineWidth=lerp(3.4,1,k);
+        ctx.beginPath(); ctx.ellipse(px,hy,rad,rad*0.155,0,0,6.283); ctx.stroke();
+      }
+      ctx.restore();
+      const sg=ctx.createRadialGradient(px,hy,0,px,hy,R*0.8);
+      sg.addColorStop(0,hex('#FFF6CF',0.24*(1-f)*settle));
+      sg.addColorStop(1,hex('#FFD700',0));
+      ctx.fillStyle=sg; ctx.fillRect(-300,Math.max(-300,hy-R),VIEW_W+600,Math.min(R,hy+300));
+    }
+  }
+}
+
+/* Six projects of meaning, reduced to the shape each one left behind. */
+function armorGhost(i,px,cy,W,a){
+  const K=['#00F0FF','#FFB703','#E63946','#FB8500','#FFD700','#00FF66'][i];
+  ctx.save(); ctx.globalAlpha=a;
+  ctx.strokeStyle=hex(K,0.9); ctx.fillStyle=hex(K,0.55); ctx.lineWidth=1.5;
+  ctx.shadowColor=hex(K,0.7); ctx.shadowBlur=8;
+  const x0=px-W/2;
+  if(i===0){                                    // the climb, still going up
+    ctx.beginPath();
+    for(let k=0;k<4;k++){ const x=x0+k*(W/3), y=cy+14-k*9; k?ctx.lineTo(x,y):ctx.moveTo(x,y); }
+    ctx.stroke();
+    for(let k=0;k<4;k++){ const x=x0+k*(W/3), y=cy+14-k*9;
+      ctx.beginPath(); ctx.moveTo(x,y-5); ctx.lineTo(x+5,y); ctx.lineTo(x,y+5); ctx.lineTo(x-5,y);
+      ctx.closePath(); ctx.fill(); }
+  } else if(i===1){                             // the routine, one step per day
+    for(let k=0;k<4;k++) ctx.strokeRect(x0+k*(W/4),cy+14-k*8,W/4-3,6);
+  } else if(i===2){                             // the dogma, sorted into two kinds
+    for(let k=0;k<4;k++){ const x=x0+k*(W/4)+3;
+      if(k%2) ctx.strokeRect(x,cy-9,W/6,18);
+      else { ctx.beginPath(); ctx.arc(x+W/12,cy,7,0,6.283); ctx.stroke(); } }
+  } else if(i===3){                             // the refuge, two lights in a ring
+    ctx.beginPath(); ctx.arc(px,cy,W*0.32,0,6.283); ctx.stroke();
+    for(const d of [-9,9]){ ctx.beginPath(); ctx.arc(px+d,cy+4,3.2,0,6.283); ctx.fill(); }
+  } else if(i===4){                             // the creation, a line that stops
+    ctx.beginPath(); ctx.moveTo(x0,cy+10);
+    for(let k=1;k<=10;k++) ctx.lineTo(x0+k*(W/10),cy+10-Math.sin(k*0.8)*8-k*0.6);
+    ctx.stroke();
+  } else {                                      // the archive, a blueprint of the cage
+    ctx.lineWidth=1;
+    for(let k=0;k<4;k++){ ctx.beginPath(); ctx.moveTo(x0,cy-9+k*6); ctx.lineTo(x0+W,cy-9+k*6); ctx.stroke(); }
+    for(let k=0;k<5;k++){ ctx.beginPath(); ctx.moveTo(x0+k*(W/4),cy-9); ctx.lineTo(x0+k*(W/4),cy+9); ctx.stroke(); }
+  }
+  ctx.restore();
+}
+
+/* The skyline, each block counting down to its own collapse. */
+function drawTowers(sun){
+  if(!PROPS.towers) return;
+  for(const t of PROPS.towers){
+    const px=wx(t.x,0.62), base=wy(terrainYSafe(t.x),0.62);
+    if(px<-320||px>VIEW_W+320) continue;
+    ctx.fillStyle=mixHex('#232b33',L.paint.night,sun*0.55);
+    ctx.fillRect(px-t.w/2,base-t.h,t.w,t.h);
+    // a very few lit windows; nobody is home in most of them
+    ctx.fillStyle=hex('#CBD5E1',0.05+t.win*0.05);
+    for(let y=base-t.h+16;y<base-16;y+=26)
+      for(let x=px-t.w/2+9;x<px+t.w/2-9;x+=20)
+        if(((x*7+y*3)|0)%5===0) ctx.fillRect(x,y,7,11);
+    // ivy taking it back
+    ctx.strokeStyle=hex('#3A5A40',0.30); ctx.lineWidth=2;
+    ctx.beginPath();
+    for(let y=base;y>base-t.h*0.55;y-=14) ctx.lineTo(px-t.w/2+Math.sin(y*0.06+t.x)*7,y);
+    ctx.stroke();
+    setFont(ctx,400,11,MONO,'0.14em'); ctx.textAlign='center';
+    ctx.fillStyle=hex('#CBD5E1',0.24);
+    ctx.fillText(`${t.tag} · ${Math.round(t.yrs)} YRS`,px,base-t.h-16);
+    clearSpace(ctx);
+  }
+}
+
+/* Thousands of people, each sealed inside their own head, passing in silence. */
+function drawCrowd(sun){
+  if(!PROPS.crowd||!PROPS.crowd.length) return;
+  for(const c of PROPS.crowd){
+    const x=c.x+S.t*c.sp;
+    const span=4900, wrapped=((x+1500)%span+span)%span-1500;
+    const px=wx(wrapped,1), py=wy(terrainYSafe(wrapped),1);
+    if(px<-40||px>VIEW_W+40) continue;
+    const bob=Math.sin(S.t*2.4+c.ph)*1.6;
+    ctx.fillStyle=hex('#CBD5E1',c.a);
+    ctx.fillRect(px-2.5,py-c.h+bob,5,c.h*0.66);
+    ctx.beginPath(); ctx.arc(px,py-c.h+bob-3,4,0,6.283); ctx.fill();
+  }
+}
+
+/* Colossal names, and how long until nobody can recall them. */
+function drawStatues(sun){
+  if(!PROPS.statues||!PROPS.statues.length) return;
+  for(const st of PROPS.statues){
+    const px=wx(st.x,1), base=wy(terrainYSafe(st.x),1);
+    if(px<-260||px>VIEW_W+260) continue;
+    const erode=clamp(1-st.yrs/1400,0,1);
+    ctx.save(); ctx.translate(px,base); ctx.rotate(st.lean);
+    ctx.fillStyle=mixHex('#4A4E69',L.paint.night,sun*0.5);
+    ctx.fillRect(-st.w*0.75,-18,st.w*1.5,18);                 // plinth
+    ctx.fillStyle=mixHex('#9A8C98',L.paint.night,sun*0.5+erode*0.35);
+    ctx.fillRect(-st.w/2,-st.h,st.w,st.h-18);                 // body
+    if(erode<0.7){ ctx.beginPath(); ctx.arc(0,-st.h-st.w*0.34,st.w*0.34,0,6.283); ctx.fill(); }
+    // dust coming off it, continuously
+    ctx.fillStyle=hex('#F2E9E4',0.05);
+    for(let i=0;i<7;i++){
+      const yy=-st.h+((S.t*13+i*40+st.x)%st.h);
+      ctx.fillRect(st.w/2+Math.sin(yy*0.2)*5,-yy,1.5,1.5);
+    }
+    ctx.restore();
+    setFont(ctx,400,11,MONO,'0.14em'); ctx.textAlign='center';
+    ctx.fillStyle=hex('#F2E9E4',0.26);
+    ctx.fillText(`${st.tag} · FORGOTTEN IN ${Math.round(st.yrs)} YRS`,px,base-st.h-30);
+    clearSpace(ctx);
+  }
+}
+
+/* The blockade. Impassable until an ideology removes it, and the arch above
+   is resting on it. */
+function drawRubble(sun){
+  if(!L.rubble) return;
+  for(let k=0;k<L.rubble.length;k++){
+    const bx=L.rubble[k];
+    const px=wx(bx,1), base=wy(terrainYSafe(bx),1);
+    if(px<-280||px>VIEW_W+280) continue;
+    const r=mulberry32(91+k*13);
+    if(!S.cleared.has(bx)){
+      ctx.fillStyle=mixHex('#2a323a',L.paint.night,sun*0.6);
+      for(let i=0;i<24;i++){
+        const w=lerp(14,40,r()), h=lerp(10,30,r());
+        ctx.fillRect(px-52+r()*104-w/2, base-h-r()*146, w, h);
+      }
+      ctx.strokeStyle=hex('#A3B18A',0.22); ctx.lineWidth=1.4;
+      ctx.beginPath(); ctx.moveTo(px-58,base); ctx.lineTo(px-28,base-146);
+      ctx.lineTo(px+38,base-126); ctx.lineTo(px+60,base); ctx.stroke();
+    } else {
+      // what fell afterwards, lying across the road you were going to use
+      ctx.fillStyle=mixHex('#1d242b',L.paint.night,sun*0.6);
+      const o=lerp(60,140,r());
+      ctx.beginPath(); ctx.moveTo(px+o,base); ctx.lineTo(px+o+58,base-lerp(140,230,r()));
+      ctx.lineTo(px+o+150,base-lerp(120,200,r())); ctx.lineTo(px+o+126,base); ctx.closePath(); ctx.fill();
+    }
+  }
+}
+
+function drawGrass(sun){
+  const w=0.6+0.4*Math.sin(S.t*0.21)+0.2*Math.sin(S.t*0.07);
+  ctx.lineWidth=1.3; ctx.lineCap='round';
+  for(const b of PROPS.grass){
+    const px=wx(b.x,1);
+    if(px<-20||px>VIEW_W+20) continue;
+    const gy=terrainYSafe(b.x), py=wy(gy,1);
+    const sway=Math.sin(S.t*1.5+b.ph+b.x*0.01)*7*w+b.lean*10+w*7;
+    ctx.strokeStyle=hex(b.c>0.6?L.paint.rim:'#5d6b58',0.30+b.c*0.22);
+    ctx.beginPath(); ctx.moveTo(px,py);
+    ctx.quadraticCurveTo(px+sway*0.4,py-b.h*0.6,px+sway,py-b.h); ctx.stroke();
+  }
+}
+
+function fmtDecay(s){
+  if(s<=0) return '—';
+  const m=Math.floor(s/60), ss=Math.floor(s%60);
+  return m>0?`${String(m).padStart(2,'0')}m ${String(ss).padStart(2,'0')}s`:`${String(ss).padStart(2,'0')}s`;
+}
+function drawFlowers(sun){
+  for(const f of PROPS.flowers){
+    const px=wx(f.x,1);
+    if(px<-60||px>VIEW_W+60) continue;
+    const gy=terrainYSafe(f.x), py=wy(gy,1);
+    const life=f.t/f.max;                      // 1 -> 0, blooming to gone
+    const sway=Math.sin(S.t*1.2+f.x*0.02)*4;
+    const h=lerp(9,26,clamp(life*1.4,0,1));
+    ctx.strokeStyle=hex(life>0?'#5d6b58':'#3a3a34',0.55);
+    ctx.lineWidth=1.5; ctx.beginPath(); ctx.moveTo(px,py);
+    ctx.quadraticCurveTo(px+sway*0.5,py-h*0.6,px+sway,py-h); ctx.stroke();
+    if(life>0.02){
+      const pr=lerp(1.4,4.2,clamp(life,0,1));
+      for(let i=0;i<5;i++){
+        const a=i/5*6.283+S.t*0.06;
+        ctx.fillStyle=`hsla(${f.hue},${Math.round(52*life)}%,${Math.round(52+18*life)}%,${0.30+0.45*life})`;
+        ctx.beginPath(); ctx.arc(px+sway+Math.cos(a)*pr,py-h+Math.sin(a)*pr,pr*0.82,0,6.283); ctx.fill();
+      }
+    }
+    setFont(ctx,400,10,MONO,'0.12em'); ctx.textAlign='center';
+    ctx.fillStyle=hex(life>0?L.paint.mote:'#7a7a72',life>0?0.30:0.16);
+    ctx.fillText(fmtDecay(f.t),px+sway,py-h-13);
+    clearSpace(ctx);
+  }
+}
+function drawMotes(){
+  const w=0.6+0.4*Math.sin(S.t*0.21);
+  for(const m of motes){
+    const sp=(30+m.z*70)*w;
+    const x=((m.x+S.t*sp)%5000+5000)%5000-1600;
+    const px=wx(x,0.55+m.z*0.45), py=wy(m.y+Math.sin(S.t*0.6+m.ph)*22,0.55+m.z*0.45);
+    if(px<-20||px>VIEW_W+20) continue;
+    ctx.fillStyle=hex(L.paint.mote,0.05+m.z*0.10);
+    ctx.beginPath(); ctx.arc(px,py,m.s*m.z,0,6.283); ctx.fill();
+  }
+}
+
+/* There is one figure in this game and it never changes shape. Legs, a torso,
+   a head: the same small animal on both sides of every cut. What changes is
+   how it is lit and whether it is shaking. */
+function playerBody(g,px,py,H){
+  const k=H/34;
+  g.fillRect(px-4.5*k,py-H*0.44,3*k,H*0.44);      // legs
+  g.fillRect(px+1.5*k,py-H*0.44,3*k,H*0.44);
+  g.beginPath();                                   // torso
+  g.moveTo(px-5*k,py-H*0.42); g.lineTo(px-4*k,py-H*0.86);
+  g.lineTo(px+4*k,py-H*0.86); g.lineTo(px+5*k,py-H*0.42); g.closePath(); g.fill();
+  g.beginPath(); g.arc(px,py-H*0.96,4.4*k,0,6.283); g.fill();   // head
+}
+
+/* The same body inside the blinders: flat, hard-edged, haloed in the armour's
+   own colour, and — the entire sales pitch, in one detail — perfectly still.
+   Not a token. Not an arrow. You, with the trembling turned off. */
+function armorFigure(g,px,py,H,key,lean){
+  g.save();
+  if(lean){ g.translate(px,py); g.rotate(clamp(lean,-1,1)*0.10); g.translate(-px,-py); }
+  g.shadowColor=hex(key,0.95); g.shadowBlur=20;
+  g.fillStyle='#FFFFFF';
+  playerBody(g,px,py,H);
+  playerBody(g,px,py,H);          // twice, so the halo builds to the armour's key
+  g.restore();
+}
+
+function drawPlayerRaw(){
+  const tr=player.tremor*(1+S.dread*0.9);
+  const jx=(Math.random()-0.5)*tr*2.4, jy=(Math.random()-0.5)*tr*2.0;
+  const px=wx(player.x,1)+jx, py=wy(player.y,1)+jy;
+  const kneel=player.kneel;
+  const H=lerp(34,20,kneel);
+
+  // on the water there is a second one of you, standing on nothing
+  if(L.shore){
+    const hy=horizonY();
+    ctx.save();
+    ctx.translate(Math.sin(S.t*1.4)*1.4,2*hy); ctx.scale(1,-1);
+    ctx.globalAlpha=0.30; ctx.fillStyle=hex('#F8FAFC',0.9);
+    playerBody(ctx,px,py,H*0.94);
+    ctx.restore();
+  }
+
+  // the glow of a small, self-aware thing
+  const g=ctx.createRadialGradient(px,py-H*0.55,0,px,py-H*0.55,86);
+  g.addColorStop(0,hex('#F8FAFC',0.30)); g.addColorStop(0.35,hex('#F8FAFC',0.09)); g.addColorStop(1,hex('#F8FAFC',0));
+  ctx.fillStyle=g; ctx.fillRect(px-90,py-H-90,180,180);
+
+  ctx.fillStyle=hex('#F8FAFC',0.94);
+  playerBody(ctx,px,py,H);
+  // long shadow — the water takes care of its own
+  if(!L.shore){
+    ctx.fillStyle=hex('#000000',0.28);
+    ctx.beginPath(); ctx.ellipse(px,py+1.5,13,3,0,0,6.283); ctx.fill();
+  }
+}
+
+function drawDreadVignette(){
+  const d=Math.max(S.dread,S.collapsed>0?0.96:0);
+  if(d<0.02) return;
+  const g=ctx.createRadialGradient(VIEW_W/2,VIEW_H/2,VIEW_H*lerp(0.62,0.16,d),VIEW_W/2,VIEW_H/2,VIEW_H*0.95);
+  g.addColorStop(0,'rgba(0,0,0,0)'); g.addColorStop(1,`rgba(0,0,0,${(0.30+d*0.66).toFixed(3)})`);
+  ctx.fillStyle=g; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  if(d>0.55){ // the world goes quiet and colourless as it closes in
+    ctx.save(); ctx.globalCompositeOperation='saturation';
+    ctx.globalAlpha=(d-0.55)/0.45*0.5; ctx.fillStyle='hsl(0,0%,50%)';
+    ctx.fillRect(0,0,VIEW_W,VIEW_H); ctx.restore();
+  }
+}
+
+/* ---------------------------------------------------- the armored states - */
+/* These add their shape to whatever path is already open rather than starting a
+   new one, because the same shape has to be able to cut a hole in the blinder
+   (rect + aperture, filled even-odd) as well as be clipped or stroked alone.
+   Beginning a path in here quietly threw the outer rect away and filled the
+   aperture itself with black, which blacked out the entire armoured view. */
+function aperture(g,cx,cy,w,h,notch){
+  g.moveTo(cx-w/2,cy);
+  g.lineTo(cx-w/2+notch,cy-h/2);
+  g.lineTo(cx+w/2-notch,cy-h/2);
+  g.lineTo(cx+w/2,cy);
+  g.lineTo(cx+w/2-notch,cy+h/2);
+  g.lineTo(cx-w/2+notch,cy+h/2);
+  g.closePath();
+}
+function apertureRect(g,cx,cy,w,h,r){
+  if(g.roundRect) g.roundRect(cx-w/2,cy-h/2,w,h,r);
+  else g.rect(cx-w/2,cy-h/2,w,h);
+}
+
+function drawArmored(g,which,open,alpha){
+  open=open===undefined?1:open; alpha=alpha===undefined?1:alpha;
+  const A=ARMORS[which];
+  g.save(); g.globalAlpha=alpha;
+  g.fillStyle=A.dark; g.fillRect(0,0,VIEW_W,VIEW_H);
+
+  const pxS=wx(player.x,1), pyS=wy(player.y,1);
+  const cx=VIEW_W*0.5;
+  const pad=(which==='archive')?S.archTrack[S.archIdx]:null;
+  const anchor=(which==='climb'&&S.baseY!==undefined)?wy(S.baseY,1)-VIEW_H*0.22
+              :pad?wy(pad.y,1)-VIEW_H*0.16:pyS-46;
+  const cy=clamp(anchor,VIEW_H*0.28,VIEW_H*0.72);
+
+  const apPath=()=>{
+    if(which==='climb') aperture(g,cx,cy,VIEW_W*1.02*open,VIEW_H*0.66*open,VIEW_W*0.15);
+    else if(which==='dogma') aperture(g,cx,cy,VIEW_W*1.02*open,VIEW_H*0.44*open,VIEW_W*0.17);
+    // moveTo first, or the circle is joined to the rect by a stray line.
+    // For the refuge the blinder is the ring: outside somebody else's light
+    // there is not a darker version of the world, there is no world.
+    else if(which==='refuge'){
+      const C=S.companion, live=C&&!C.gone;
+      const rx=live?wx(C.x,1):pxS, ry=(live?wy(C.y,1):pyS)-40, r=refugeRing()*open;
+      g.moveTo(rx+r,ry); g.arc(rx,ry,r,0,6.283);
+    }
+    else if(which==='creation') apertureRect(g,cx,cy,VIEW_W*0.92*open,VIEW_H*0.70*open,26);
+    else apertureRect(g,cx,cy,VIEW_W*0.88*open,VIEW_H*0.66*open,18);
+  };
+  g.save(); g.beginPath(); apPath(); g.clip();
+  if(which==='climb') drawClimbInner(g);
+  else if(which==='routine') drawRoutineInner(g);
+  else if(which==='dogma') drawDogmaInner(g);
+  else if(which==='refuge') drawRefugeInner(g);
+  else if(which==='creation') drawCreationInner(g);
+  else drawArchiveInner(g);
+  g.restore();
+
+  // pitch-black blinders outside the aperture — 90% of the world, gone
+  g.beginPath(); g.rect(0,0,VIEW_W,VIEW_H); apPath();
+  g.fillStyle=A.dark; g.fill('evenodd');
+
+  // the hard edge of the blinder
+  g.lineWidth=1.2; g.strokeStyle=hex(A.key,0.30);
+  g.beginPath(); apPath(); g.stroke();
+
+  // and you, always, even when you have walked out of the light
+  if(which==='refuge') armorFigure(g,pxS,pyS,34,ARMORS.refuge.key,player.vx/REFUGE_V);
+
+  drawArmorHUD(g,which);
+  g.restore();
+}
+
+function drawClimbInner(g){
+  const K=P.climb.cyan;
+  // faint background lattice: the world reduced to a grid you can win on
+  g.lineWidth=1; g.strokeStyle=hex(K,0.055);
+  const step=64, ox=-((cam.x*0.5)%step), oy=-((cam.y*0.5)%step);
+  g.beginPath();
+  for(let x=ox;x<VIEW_W+step;x+=step){ g.moveTo(x,0); g.lineTo(x,VIEW_H); }
+  for(let y=oy;y<VIEW_H+step;y+=step){ g.moveTo(0,y); g.lineTo(VIEW_W,y); }
+  g.stroke();
+
+  const C=S.course;
+  if(!C||!C.length) return;
+
+  // the rungs. The last one is the only one that is anywhere.
+  for(const p of C){
+    const px=wx(platX(p),1), py=wy(p.y,1);
+    if(px<-300||px>VIEW_W+300) continue;
+    g.save();
+    g.shadowColor=hex(K,0.9); g.shadowBlur=p.exit?26:14;
+    if(p.exit){
+      const beat=0.5+0.5*Math.sin(S.t*3);
+      g.fillStyle=hex('#FFFFFF',0.55+beat*0.25);
+      g.fillRect(px-p.w/2,py,p.w,PLAT_H);
+      const beam=g.createLinearGradient(0,py,0,py+VIEW_H*0.5);
+      beam.addColorStop(0,hex(K,0.20)); beam.addColorStop(1,hex(K,0));
+      g.fillStyle=beam; g.fillRect(px-p.w/2,py+PLAT_H,p.w,VIEW_H*0.5);
+    } else {
+      g.fillStyle=hex(K,0.30);
+      g.fillRect(px-p.w/2,py,p.w,PLAT_H);
+      g.strokeStyle=hex(K,0.95); g.lineWidth=1.8;
+      g.strokeRect(px-p.w/2,py,p.w,PLAT_H);
+      // the supports, running down into nothing
+      g.strokeStyle=hex(K,0.14); g.lineWidth=1;
+      g.beginPath(); g.moveTo(px,py+PLAT_H); g.lineTo(px,py+PLAT_H+70); g.stroke();
+    }
+    g.restore();
+    if(p.exit){
+      setFont(g,400,11,MONO,'0.22em'); g.textAlign='center';
+      g.fillStyle=hex('#FFFFFF',0.55);
+      g.fillText('THE NEXT LEVEL',px,py-16); clearSpace(g);
+    }
+  }
+
+  /* The cut line, coming up from underneath at exactly the rate the clock in
+     the corner runs down. It is the only honest thing on this screen: it says,
+     without any euphemism at all, that you cannot stay where you are. */
+  const fy=wy(climbFloor(),1);
+  if(fy<VIEW_H+60){
+    const gd=g.createLinearGradient(0,fy,0,fy+VIEW_H*0.45);
+    gd.addColorStop(0,hex(K,0.22)); gd.addColorStop(0.18,'rgba(0,0,0,0.88)'); gd.addColorStop(1,'#000');
+    g.fillStyle=gd; g.fillRect(-40,fy,VIEW_W+80,VIEW_H+200);
+    g.strokeStyle=hex(K,0.12); g.lineWidth=1;
+    g.beginPath();
+    const hs=26, ho=-((S.t*24)%hs);
+    for(let x=ho-hs;x<VIEW_W+hs;x+=hs){ g.moveTo(x,fy+hs); g.lineTo(x+hs,fy); }
+    g.stroke();
+    g.save(); g.shadowColor=hex('#FF4A4A',0.8); g.shadowBlur=16;
+    g.strokeStyle=hex('#FF4A4A',0.42+0.34*Math.abs(Math.sin(S.t*2.6)));
+    g.lineWidth=1.8; g.beginPath(); g.moveTo(-40,fy); g.lineTo(VIEW_W+40,fy); g.stroke();
+    g.restore();
+    // named in the empty water below it, where there is never a rung to collide with
+    setFont(g,400,us(10),MONO,'0.26em'); g.textAlign='right';
+    g.fillStyle=hex('#FF4A4A',0.46);
+    g.fillText('CUT LINE',VIEW_W*0.80,fy+us(19)); clearSpace(g);
+  }
+
+  // the player: the same body as out there, not trembling, and lit like a target
+  const px=wx(player.x,1), py=wy(player.y,1);
+  armorFigure(g,px,py,36,K,player.vx/RUN);
+  // and the line of the jump you are in the middle of
+  if(!S.onPlat){
+    g.strokeStyle=hex(K,0.28); g.lineWidth=1; g.setLineDash([3,5]);
+    g.beginPath(); g.moveTo(px,py); g.lineTo(px,py+90); g.stroke(); g.setLineDash([]);
+  }
+}
+
+function drawRoutineInner(g){
+  const K=P.routine.amber, G=P.routine.gold;
+  // muted grid — the shape of a day
+  g.lineWidth=1; g.strokeStyle=hex(K,0.06);
+  const step=48, ox0=-((cam.x)%step), oy0=-((cam.y)%step);
+  g.beginPath();
+  for(let x=ox0;x<VIEW_W+step;x+=step){ g.moveTo(x,0); g.lineTo(x,VIEW_H); }
+  for(let y=oy0;y<VIEW_H+step;y+=step){ g.moveTo(0,y); g.lineTo(VIEW_W,y); }
+  g.stroke();
+
+  const RT=S.routineTrack;
+  if(!RT.length) return;
+  /* The staircase has its own space. It has to: the whole point of it is that
+     it looks the same everywhere, whatever the ground underneath is doing. */
+  const cur=RT[RT.length-1], prev=RT.length>1?RT[RT.length-2]:cur;
+  const e=smooth(clamp(S.stepAnim,0,1));
+  const px=VIEW_W*0.46, py=VIEW_H*0.64;
+  const ox=px-lerp(prev.vx,cur.vx,e), oy=py-lerp(prev.vy,cur.vy,e);
+  const w=78, d=15;
+
+  const drawStep=(x,y,a,ghost,ground)=>{
+    g.save(); g.globalAlpha=a;
+    g.shadowColor=hex(K,0.55); g.shadowBlur=ghost?4:12;
+    g.fillStyle=hex(ghost?K:G,ghost?0.06:0.20);
+    g.beginPath(); g.moveTo(x-w/2,y); g.lineTo(x-w/2+d,y-d); g.lineTo(x+w/2+d,y-d); g.lineTo(x+w/2,y); g.closePath(); g.fill();
+    g.lineWidth=ghost?1.2:1.6; g.strokeStyle=hex(ghost?K:G,ghost?0.28:0.85); g.stroke();
+    g.fillStyle=hex(K,ghost?0.03:0.11);
+    g.beginPath(); g.moveTo(x-w/2,y); g.lineTo(x+w/2,y); g.lineTo(x+w/2,y+30); g.lineTo(x-w/2,y+30); g.closePath(); g.fill();
+    // the only thing the armour will tell you about the world it is covering:
+    // whether this particular morning had anything underneath it
+    if(!ghost&&ground){
+      // there was something under that one. The armour will not tell you what
+      // it means, and by now you may have stopped noticing it at all.
+      g.shadowColor=hex(G,0.9); g.shadowBlur=10;
+      g.strokeStyle=hex(G,0.8); g.lineWidth=3;
+      g.beginPath(); g.moveTo(x-w/2+2,y+32); g.lineTo(x+w/2+2,y+32); g.stroke();
+    }
+    g.restore();
+  };
+
+  for(const st of RT){
+    const x=ox+st.vx, y=oy+st.vy;
+    if(x<-200||x>VIEW_W+200) continue;
+    drawStep(x,y,1,false,st.ground);
+  }
+  // tomorrow, which is exactly like today
+  if(!S.routineEnd) drawStep(ox+cur.vx+STAIR_DX,oy+cur.vy+STAIR_DY,0.75,true,false);
+
+  // the beat you are trying to keep: a ring that closes on every tick
+  const ph=1-clamp(S.beatT/Math.max(S.beatDur,0.01),0,1);
+  g.save();
+  g.lineWidth=2; g.strokeStyle=hex(G,0.16+0.5*ph);
+  g.beginPath(); g.arc(px,py-24,lerp(58,16,ph),0,6.283); g.stroke();
+  if(S.beatHit>0){
+    g.lineWidth=3; g.strokeStyle=hex('#FFF3DA',S.beatHit*0.9);
+    g.beginPath(); g.arc(px,py-24,20+(1-S.beatHit)*26,0,6.283); g.stroke();
+  }
+  g.restore();
+
+  armorFigure(g,px,py,36,G,0);
+}
+
+/* ------------------------------------------------------------- THE DOGMA */
+function drawDogmaInner(g){
+  const K=ARMORS.dogma.key, W='#FFFFFF', T=S.dogmaTrack;
+  const px=wx(player.x,1), py=wy(player.y,1);
+  const spd=clamp(S.dogV/DOG_VMAX,0,1);
+
+  // uprights, going past
+  g.lineWidth=1; g.strokeStyle=hex(W,0.045);
+  const step=110, ox=-(cam.x%step);
+  g.beginPath();
+  for(let x=ox;x<VIEW_W+step;x+=step){ g.moveTo(x,0); g.lineTo(x,VIEW_H); }
+  g.stroke();
+
+  // speed, which is the only quantity this armour is really interested in
+  g.strokeStyle=hex(W,0.04+0.20*spd); g.lineWidth=1.6;
+  g.beginPath();
+  for(let i=0;i<18;i++){
+    const yy=py-18-((i*67+S.t*140*spd)%340);
+    const len=lerp(30,260,spd)*(0.4+((i*37)%11)/18);
+    const xx=((i*233+S.t*1100*spd)%(VIEW_W+500))-250;
+    g.moveTo(xx,yy); g.lineTo(xx-len,yy);
+  }
+  g.stroke();
+
+  // the road
+  g.save(); g.shadowColor=hex(W,0.5); g.shadowBlur=10;
+  g.strokeStyle=hex(W,0.55); g.lineWidth=2;
+  g.beginPath(); g.moveTo(-40,py); g.lineTo(VIEW_W+40,py); g.stroke(); g.restore();
+
+  // the things in the road, which are all one kind of thing in here
+  for(const o of T){
+    const bx=wx(o.x,1);
+    if(bx<-200||bx>VIEW_W+200) continue;
+    if(o.dead){
+      g.save(); g.globalAlpha=0.13;
+      g.fillStyle=hex(K,0.5); g.strokeStyle=hex(K,0.8); g.lineWidth=1.6;
+      g.fillRect(bx-30,py-92,60,92); g.strokeRect(bx-30,py-92,60,92); g.restore();
+    } else {
+      const near=clamp(1-(o.x-player.x)/640,0,1);
+      g.save(); g.shadowColor=hex(K,0.95); g.shadowBlur=8+20*near;
+      g.fillStyle=hex(K,0.26+0.30*near); g.strokeStyle=hex(K,1); g.lineWidth=2.6;
+      g.fillRect(bx-34,py-104,68,104); g.strokeRect(bx-34,py-104,68,104);
+      g.fillStyle=hex(W,0.65); g.fillRect(bx-34,py-104,68,4);
+      g.restore();
+    }
+  }
+
+  /* The strike window. The one measurement offered in here, and it is a
+     measurement of how close a thing has to be before you are allowed to
+     destroy it — never of what it is. */
+  if(!S.stranded){
+    const wEnd=px+DOG_WIN;
+    g.save(); g.strokeStyle=hex(K,0.22+0.2*S.dogSwing); g.lineWidth=1.4;
+    g.setLineDash([5,7]);
+    g.beginPath(); g.moveTo(wEnd,py-120); g.lineTo(wEnd,py+14); g.stroke();
+    g.setLineDash([]);
+    g.strokeStyle=hex(K,0.16); g.beginPath();
+    g.moveTo(px,py+10); g.lineTo(wEnd,py+10); g.stroke();
+    g.restore();
+  }
+
+  // the swing itself
+  if(S.dogSwing>0.01){
+    g.save(); g.globalAlpha=S.dogSwing;
+    g.strokeStyle=hex(W,0.9); g.lineWidth=3; g.shadowColor=hex(W,0.9); g.shadowBlur=14;
+    g.beginPath(); g.arc(px+18,py-46,52,-1.15,0.55); g.stroke(); g.restore();
+  }
+  if(S.dogFlash>0.01){
+    g.fillStyle=hex(W,S.dogFlash*0.16); g.fillRect(0,0,VIEW_W,VIEW_H);
+  }
+  if(S.dogStall>0){
+    g.fillStyle=hex(K,Math.min(0.30,S.dogStall*0.32)); g.fillRect(0,0,VIEW_W,VIEW_H);
+    setFont(g,400,us(13),MONO,'0.30em'); g.textAlign='center';
+    g.fillStyle=hex(W,0.55+0.3*Math.sin(S.t*18));
+    g.fillText('STOPPED',VIEW_W/2,py-150); clearSpace(g);
+  }
+
+  armorFigure(g,px,py,36,K,spd*0.9);
+}
+
+/* ------------------------------------------------------------ THE REFUGE */
+function drawRefugeInner(g){
+  const K=ARMORS.refuge.key, G='#FFB703', C=S.companion;
+  const px=wx(player.x,1), py=wy(player.y,1);
+  const live=C&&!C.gone;
+  const cxp=C?wx(C.x,1):px, cyp=C?wy(C.y,1):py;
+  const ring=refugeRing();
+  // The lit part of the world is a circle around somebody else.
+  const gx=live?cxp:px, gy=(live?cyp:py)-40;
+  const gr=g.createRadialGradient(gx,gy,10,gx,gy,ring);
+  gr.addColorStop(0,hex(G,0.19)); gr.addColorStop(0.58,hex(K,0.07)); gr.addColorStop(1,hex(K,0));
+  g.fillStyle=gr; g.fillRect(0,0,VIEW_W,VIEW_H);
+
+  // the ground, only as far as the light goes
+  g.save();
+  g.beginPath(); g.arc(gx,gy,ring,0,6.283); g.clip();
+  g.strokeStyle=hex(G,0.36); g.lineWidth=2;
+  g.beginPath();
+  for(let x=-200;x<VIEW_W+200;x+=14){
+    const wxx=x+cam.x, yy=wy(terrainYSafe(wxx),1);
+    if(x===-200) g.moveTo(x,yy); else g.lineTo(x,yy);
+  }
+  g.stroke();
+  g.restore();
+
+  if(live){
+    const glow=g.createRadialGradient(cxp,cyp-26,0,cxp,cyp-26,88);
+    glow.addColorStop(0,hex(G,0.52)); glow.addColorStop(1,hex(G,0));
+    g.fillStyle=glow; g.fillRect(cxp-92,cyp-118,184,184);
+    g.save(); g.shadowColor=hex(G,0.9); g.shadowBlur=14; g.fillStyle='#FFF3DA';
+    playerBody(g,cxp,cyp,30); playerBody(g,cxp,cyp,30); g.restore();
+    // the thread, going thin
+    const t=clamp(S.thread/REFUGE_SLACK,0,1);
+    g.save();
+    g.strokeStyle=hex(S.refugeNear?G:'#FF8A5B',0.12+0.30*t);
+    g.lineWidth=lerp(0.6,1.8,t);
+    g.setLineDash([lerp(2,6,t),lerp(14,7,t)]);
+    g.beginPath(); g.moveTo(px,py-22); g.lineTo(cxp,cyp-22); g.stroke();
+    g.restore(); g.setLineDash([]);
+    // outside it, the dark closes in at the rate the thread runs out
+    if(!S.refugeNear){
+      const v=g.createRadialGradient(px,py-40,VIEW_H*0.10,px,py-40,VIEW_H*0.62);
+      v.addColorStop(0,'rgba(0,0,0,0)');
+      v.addColorStop(1,`rgba(0,0,0,${(0.30+0.55*(1-t)).toFixed(3)})`);
+      g.fillStyle=v; g.fillRect(0,0,VIEW_W,VIEW_H);
+    }
+  } else if(C){
+    g.fillStyle=hex('#FFFFFF',0.16+0.10*Math.sin(S.t*3));
+    g.beginPath(); g.arc(cxp,cyp-30,4+Math.sin(S.t*2)*2,0,6.283); g.fill();
+  }
+}
+
+/* ---------------------------------------------------------- THE CREATION */
+function drawCreationInner(g){
+  const K=ARMORS.creation.key, V=ARMORS.creation.sub;
+  const bg=g.createLinearGradient(0,0,0,VIEW_H);
+  bg.addColorStop(0,hex(V,0.16)); bg.addColorStop(1,hex('#08040C',0));
+  g.fillStyle=bg; g.fillRect(0,0,VIEW_W,VIEW_H);
+  // real ground, faintly, so you can tell where you actually still have some
+  g.strokeStyle=hex(V,0.30); g.lineWidth=2;
+  for(const r of solidRuns()){
+    g.beginPath(); let first=true;
+    for(let x=r[0];x<=r[1];x+=16){
+      const yy=terrainY(x); if(yy===null) continue;
+      const sx=wx(x,1), sy=wy(yy,1);
+      if(sx<-200||sx>VIEW_W+200) continue;
+      if(first){ g.moveTo(sx,sy); first=false; } else g.lineTo(sx,sy);
+    }
+    g.stroke();
+  }
+  // where it has to reach, which is the only part of the room this armour
+  // is prepared to admit exists
+  if(S.paintGoal){
+    const gx=wx(S.paintGoal,1), gy2=wy(terrainYSafe(S.paintGoal),1);
+    if(gx>-200&&gx<VIEW_W+200){
+      g.save(); g.strokeStyle=hex(K,0.34); g.lineWidth=1.4; g.setLineDash([4,7]);
+      g.beginPath(); g.moveTo(gx,gy2-VIEW_H*0.35); g.lineTo(gx,gy2+40); g.stroke();
+      g.restore(); g.setLineDash([]);
+    }
+  }
+  // what you have made, drying as you look at it
+  g.save(); g.lineCap='round';
+  for(let i=1;i<S.trail.length;i++){
+    const a=S.trail[i-1], b=S.trail[i];
+    const ax=wx(a.x,1), ay=wy(a.y,1), bx2=wx(b.x,1), by2=wy(b.y,1);
+    if(bx2<-200||ax>VIEW_W+200) continue;
+    const dry=clamp(b.age/PAINT_DRY,0,1);
+    g.strokeStyle=dry<1?hex(K,0.95-dry*0.55):hex('#6b5a2a',0.35);
+    g.lineWidth=dry<1?4-dry*2:1.4;
+    g.shadowColor=hex(K,0.8); g.shadowBlur=dry<1?14*(1-dry):0;
+    g.beginPath(); g.moveTo(ax,ay); g.lineTo(bx2,by2); g.stroke();
+    if(dry>=1&&(i%7===0)){ g.fillStyle=hex('#6b5a2a',0.5); g.fillRect(bx2,by2,2,7); }
+  }
+  g.restore();
+  const px=wx(player.x,1), py=wy(player.y,1);
+  // the aim of the next stroke, held out in front of you
+  if(S.paint>0&&!S.stranded){
+    const L2=132, ex=px+Math.cos(S.paintAng)*L2, ey=py+Math.sin(S.paintAng)*L2;
+    g.save(); g.setLineDash([3,6]); g.strokeStyle=hex(K,0.5); g.lineWidth=1.6;
+    g.beginPath(); g.moveTo(px,py); g.lineTo(ex,ey); g.stroke();
+    g.restore(); g.setLineDash([]);
+  }
+  armorFigure(g,px,py,32,K,0);
+}
+
+/* ----------------------------------------------------------- THE ARCHIVE */
+function drawArchiveInner(g){
+  const K=ARMORS.archive.key, SUB=ARMORS.archive.sub, T=S.archTrack;
+  g.lineWidth=1; g.strokeStyle=hex(SUB,0.9);
+  const step=40, ox=-((cam.x)%step), oy=-((cam.y)%step);
+  g.beginPath();
+  for(let x=ox;x<VIEW_W+step;x+=step){ g.moveTo(x,0); g.lineTo(x,VIEW_H); }
+  for(let y=oy;y<VIEW_H+step;y+=step){ g.moveTo(0,y); g.lineTo(VIEW_W,y); }
+  g.stroke();
+  if(!T||!T.length) return;
+  const vis=Math.min(S.archIdx+1,T.length-1);
+  for(let i=0;i<=vis;i++){
+    const n=T[i], px=wx(n.x,1), py=wy(n.y,1), hw=n.w/2;
+    if(px<-260||px>VIEW_W+260) continue;
+    const done=i<=S.archIdx, bad=!n.ok;
+    g.save(); g.shadowColor=hex(bad?'#FF4A4A':K,0.8); g.shadowBlur=done?14:8;
+    g.strokeStyle=hex(bad?'#FF4A4A':K,done?0.95:0.6); g.lineWidth=n.ground?3:2;
+    g.beginPath(); g.moveTo(px-hw,py); g.lineTo(px+hw,py); g.stroke();
+    g.beginPath(); g.moveTo(px-hw,py); g.lineTo(px-hw+12,py+13);
+    g.moveTo(px+hw,py); g.lineTo(px+hw-12,py+13); g.stroke();
+    g.restore();
+    setFont(g,400,10,MONO,'0.12em'); g.textAlign='center';
+    g.fillStyle=hex(bad?'#FF4A4A':K,0.45);
+    g.fillText(bad?'UNDEFINED':(n.ground?'STONE':('0x'+(i*17%256).toString(16).toUpperCase().padStart(2,'0'))),px,py+26);
+    clearSpace(g);
+  }
+
+  /* The aim, and the arc it computes for it. This is the whole of what the
+     armour is offering: it will tell you exactly where you are going to land,
+     and it will be right, and it will never say whether that is anywhere. */
+  const a=T[S.archIdx], b=T[S.archIdx+1];
+  if(a&&b&&!S.archDash&&!S.archUndef){
+    const hit=archSolve(S.archAng,a,b);
+    const good=hit&&Math.abs(hit.x-b.x)<=b.w/2;
+    const col=good?K:'#FF4A4A';
+    const vx0=Math.cos(S.archAng)*ARCH_V, vy0=-Math.sin(S.archAng)*ARCH_V;
+    const tof=hit?hit.t:1.1;
+    g.save(); g.setLineDash([4,7]); g.lineWidth=1.5; g.strokeStyle=hex(col,0.62);
+    g.beginPath();
+    for(let k=0;k<=34;k++){
+      const tt=tof*k/34;
+      const xx=wx(a.x+vx0*tt,1), yy=wy(a.y+vy0*tt+0.5*ARCH_G*tt*tt,1);
+      if(k===0) g.moveTo(xx,yy); else g.lineTo(xx,yy);
+    }
+    g.stroke(); g.restore(); g.setLineDash([]);
+    if(hit){
+      const lx=wx(hit.x,1), ly=wy(b.y,1);
+      g.strokeStyle=hex(col,0.9); g.lineWidth=2;
+      g.beginPath(); g.moveTo(lx,ly-13); g.lineTo(lx,ly+13); g.stroke();
+    }
+    const d=Math.round(b.x-a.x), miss=hit?Math.round(hit.x-b.x):null;
+    setFont(g,400,us(11),MONO,'0.16em'); g.textAlign='center';
+    g.fillStyle=hex(col,0.68);
+    const mid=(wx(a.x,1)+wx(b.x,1))/2;
+    g.fillText(b.ok
+      ? `θ ${(S.archAng*180/Math.PI).toFixed(1)}°   d ${d}   Δ ${miss>0?'+':''}${miss}`
+      : `θ = 0/0   d ${d}   OUT OF RANGE`,
+      mid,Math.min(wy(a.y,1),wy(b.y,1))-116);
+    clearSpace(g);
+  }
+  if(S.archUndef){
+    // the blueprint tears
+    g.save(); g.strokeStyle=hex('#FF4A4A',0.5+0.3*Math.sin(S.t*22)); g.lineWidth=2;
+    for(let i=0;i<7;i++){
+      const yy=(i*137+((S.t*260)%VIEW_H))%VIEW_H;
+      g.beginPath(); g.moveTo(0,yy); g.lineTo(VIEW_W,yy+rr(-8,8)); g.stroke();
+    }
+    g.restore();
+  }
+  const px=wx(player.x,1), py=wy(player.y,1);
+  armorFigure(g,px,py,32,K,0);
+}
+
+function drawArmorHUD(g,which){
+  const A=ARMORS[which];
+  const rx=VIEW_W-us(34), ry=us(42);
+  g.textAlign='right';
+  setFont(g,300,us(15),SANS,'0.34em');
+  g.fillStyle=hex(A.key,0.85); g.fillText(A.name,rx,ry);
+  setFont(g,400,us(12),MONO,'0.20em');
+  let line='';
+  // Metrics that only ever go up, and never divulge a denominator. You cannot
+  // read your remaining runway off a career, or off a habit streak.
+  if(which==='climb'){
+    // a metric that only goes up, beside the only number that matters
+    const kpi=Math.round(100-38*Math.pow(0.72,Math.max(0,(S.course||[]).indexOf(S.onPlat))));
+    line=`KPI ${kpi}%  //  REVIEW IN ${Math.max(0,S.armT).toFixed(1)}s`;
+  } else if(which==='routine'){
+    line=`DAY ${String(S.routineIdx).padStart(2,'0')}/${STAIR_STEPS}  //  CADENCE ${S.cadence}  //  ${Math.max(0,S.armT).toFixed(0)}s`;
+    if(S.stumbles) line+=`  //  ${S.stumbles} MISSED`;
+  } else if(which==='dogma'){
+    // a metric that cannot go down, beside two that can
+    line=`PURITY 100%  //  ${String(Math.round(S.dogV)).padStart(3,' ')} u/s  //  CLEARED ${S.dogHits+S.dogSlams}  //  ${Math.max(0,S.armT).toFixed(0)}s`;
+  } else if(which==='refuge'){
+    const c=S.companion;
+    // the one number in here, and it is about you, not about how long they have
+    line=`HARMONY ${c&&!c.gone?String(Math.round(clamp(S.thread/REFUGE_SLACK,0,1)*100)).padStart(3,' ')+'%':'  --'}`;
+  } else if(which==='creation'){
+    // a fuel readout that says how much is left but never how much was needed
+    line=`CANVAS ${String(Math.round(S.paint/PAINT_TOTAL*100)).padStart(3,' ')}% FUEL`;
+  } else {
+    line=`EVAL ${S.archUndef?'UNDEFINED':'VALID'}  //  SOLVED ${S.archIdx}`
+        +(S.archErr?`  //  ${S.archErr} REDERIVED`:'')+`  //  ${Math.max(0,S.armT).toFixed(0)}s`;
+  }
+  g.fillStyle=hex(A.key,0.55); g.fillText(line,rx,ry+us(22));
+  if(S.stranded){
+    const f=0.45+0.55*Math.abs(Math.sin(S.t*3.4));
+    g.fillStyle=hex('#FF4A4A',f); setFont(g,400,us(12),MONO,'0.22em');
+    g.fillText({climb:'PROMOTION CEILING REACHED',routine:'THE STAIRS GO NO HIGHER',
+                dogma:'THE ROAD CAME DOWN WITH IT',refuge:'LIFESPAN COMPLETE',
+                creation:'OUT OF PAINT',archive:'UNDEFINED / DIVIDE BY ZERO'}[which]||'',rx,ry+us(46));
+    g.fillStyle=hex('#FF4A4A',0.34+0.2*Math.sin(S.t*1.7)); setFont(g,400,us(11),MONO,'0.18em');
+    g.fillText(`PRESSURE RETURNING  ${Math.round(S.dread*100)}%`,rx,ry+us(68));
+  }
+  clearSpace(g);
+}
+
+/* ------------------------------------------------------- transition draw - */
+function drawEquip(tr){
+  const t=tr.t;
+  const p2=inv(0.20,0.50,t);           // desaturate + black out
+  const p3=inv(0.50,0.70,t);           // lock in
+  if(t<0.66){
+    drawRaw({desat:p2,dark:p2*0.98,blur:p2*7});
+  } else {
+    ctx.fillStyle=ARMORS[tr.armor].dark; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  }
+  // Phase 1: geometric blinder lines sweep in from the screen edges
+  const p1=inv(0,0.20,t), e=easeOutCubic(p1);
+  ctx.fillStyle='#000';
+  const bw=VIEW_W*0.5*e, bh=VIEW_H*0.5*e;
+  ctx.fillRect(0,0,bw,VIEW_H); ctx.fillRect(VIEW_W-bw,0,bw,VIEW_H);
+  ctx.fillRect(0,0,VIEW_W,bh*0.62); ctx.fillRect(0,VIEW_H-bh*0.62,VIEW_W,bh*0.62);
+  ctx.strokeStyle=hex(ARMORS[tr.armor].key,0.5*(1-p1)); ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(bw,0); ctx.lineTo(bw,VIEW_H); ctx.moveTo(VIEW_W-bw,0); ctx.lineTo(VIEW_W-bw,VIEW_H); ctx.stroke();
+  // Phase 3: the armour opens
+  if(p3>0){ drawArmored(ctx,tr.armor,easeOutCubic(p3),1); }
+}
+
+function drawShatter(tr){
+  const t=tr.t, soft=tr.soft;
+  const fr=inv(0,soft?0.5:0.30,t);
+  const rush=inv(soft?0.35:0.30,soft?1.2:0.80,t);
+  const shardE=easeOutCubic(rush);
+
+  if(rush<=0.001){
+    ctx.drawImage(snapCv,0,0,VIEW_W,VIEW_H);
+  } else {
+    // the world rushes back in, overwhelming and at full scale
+    ctx.save();
+    const sc=lerp(REDUCED?1.0:1.10,1.0,easeOutCubic(rush));
+    ctx.translate(VIEW_W/2,VIEW_H/2); ctx.scale(sc,sc); ctx.translate(-VIEW_W/2,-VIEW_H/2);
+    ctx.globalAlpha=clamp(rush*1.7,0,1);
+    drawRaw({});
+    ctx.restore();
+    // the blinders fly apart
+    ctx.save(); ctx.globalAlpha=clamp(1-rush*1.25,0,1);
+    for(const s of tr.shards){
+      ctx.save();
+      const off=shardE*(soft?260:540)*s.sp;
+      ctx.translate(VIEW_W/2+s.dx*off,VIEW_H/2+s.dy*off);
+      ctx.rotate(s.rot*shardE); ctx.translate(-VIEW_W/2,-VIEW_H/2);
+      const p=shardTri(s);
+      ctx.beginPath(); ctx.moveTo(p[0][0],p[0][1]); ctx.lineTo(p[1][0],p[1][1]); ctx.lineTo(p[2][0],p[2][1]); ctx.closePath();
+      ctx.clip(); ctx.drawImage(snapCv,0,0,VIEW_W,VIEW_H);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+  // Phase 1: the fracture
+  if(fr<1&&!soft){
+    ctx.save(); ctx.strokeStyle=hex('#FFFFFF',0.9*(1-fr*0.4)); ctx.lineWidth=1.4;
+    ctx.shadowColor='#fff'; ctx.shadowBlur=12;
+    const R=Math.hypot(VIEW_W,VIEW_H)*0.6*easeOutCubic(fr);
+    for(const s of tr.shards){
+      ctx.beginPath(); ctx.moveTo(VIEW_W/2,VIEW_H/2);
+      let x=VIEW_W/2,y=VIEW_H/2;
+      for(let k=1;k<=4;k++){
+        x=VIEW_W/2+s.dx*R*(k/4)+Math.sin(k*3+s.rot*9)*11;
+        y=VIEW_H/2+s.dy*R*(k/4)+Math.cos(k*2+s.rot*7)*11;
+        ctx.lineTo(x,y);
+      }
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  if(!soft&&t>0.24&&t<0.34){ ctx.fillStyle=hex('#FFFFFF',(1-Math.abs(t-0.29)/0.05)*0.5); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+  if(soft&&t>0.2&&t<0.9){ ctx.fillStyle=hex('#FFD166',(1-Math.abs(t-0.55)/0.35)*0.14); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+}
+
+/* What a slip looks like from the inside. The world is drawn once — jolted off
+   its axis, too soft and too dark to read — and then the frame is put straight
+   back over it with a band or two missing. The first time you get an edge of it
+   and no time at all. It is not a glimpse of the ridge. It is the suspicion
+   that there is one. */
+function drawTear(tr){
+  const g=tr.g, u=(g-1)/5, k=clamp(tr.t/tr.dur,0,1);
+  // framed on the ground you are actually standing over, not on the ladder's
+  // idea of where you are — by now the ladder is a thousand units above it
+  const cx0=cam.x, cy0=cam.y;
+  const fx=(S.courseFrom?S.courseFrom.x:player.x);
+  cam.x=fx-VIEW_W*0.34+Math.sin(tr.t*47)*9*g;
+  cam.y=terrainYSafe(fx)-VIEW_H*0.58+Math.cos(tr.t*39)*7*g;
+  drawRaw({desat:lerp(0.70,0.06,u),dark:lerp(0.72,0.03,u),blur:lerp(12,1.6,u)});
+  cam.x=cx0; cam.y=cy0;
+
+  // the armour, still up, with the slip cut out of it
+  const open=Math.sin(Math.PI*Math.min(1,k*1.12)), bands=[];
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0,0,VIEW_W,VIEW_H);
+  for(const b of tr.bands){
+    const y=b.yf*VIEW_H, h=Math.max(3,b.hf*VIEW_H*open);
+    bands.push([y,h]); ctx.rect(-40,y,VIEW_W+80,h);
+  }
+  ctx.clip('evenodd');
+  ctx.drawImage(snapCv,0,0,VIEW_W,VIEW_H);
+  ctx.restore();
+
+  // torn edges, lit in the armour's own colour, because it is the armour tearing
+  ctx.save();
+  ctx.strokeStyle=hex(P.climb.cyan,0.55*open); ctx.lineWidth=1;
+  ctx.shadowColor=hex(P.climb.cyan,0.85); ctx.shadowBlur=10;
+  ctx.beginPath();
+  for(const b of bands){ ctx.moveTo(-40,b[0]); ctx.lineTo(VIEW_W+40,b[0]);
+                         ctx.moveTo(-40,b[0]+b[1]); ctx.lineTo(VIEW_W+40,b[0]+b[1]); }
+  ctx.stroke(); ctx.restore();
+  if(k<0.22){ ctx.fillStyle=hex('#FFFFFF',(1-k/0.22)*0.18); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+}
+
+/* You learn the reach of a lie by having lived one. Once you have worn an
+   armour and taken it off, the raw world will show you the envelope of what it
+   buys from where you are standing — never from inside it, and never before.
+   It shows you the two extremes; what a mixture of them does is still yours to
+   work out, against a landscape only this state lets you see. */
+function drawReach(sel){
+  if(!L.proto||!sel||!lived.has(sel)||!S.unlocked.has(sel)) return;
+  const K=ARMORS[sel].key, px=wx(player.x,1), py=wy(player.y,1);
+  const ends=[];
+  if(sel==='climb'){
+    // the shape of the thing, laid over the drop it proposes to cross
+    const course=buildClimbCourse(player.x,player.y), last=course[course.length-1];
+    ctx.save();
+    ctx.setLineDash([5,7]); ctx.lineWidth=1.4; ctx.strokeStyle=hex(K,0.45);
+    for(const p of course) ctx.strokeRect(wx(p.x,1)-p.w/2,wy(p.y,1),p.w,PLAT_H);
+    ctx.setLineDash([]);
+    setFont(ctx,400,us(9),MONO,'0.20em'); ctx.textAlign='center';
+    ctx.fillStyle=hex(K,0.5);
+    ctx.fillText(courseTime(course).toFixed(0)+'s OF IT',wx(last.x,1),wy(last.y,1)-us(16));
+    clearSpace(ctx); ctx.restore();
+    return;
+  } else if(sel==='routine'){
+    ends.push({x:player.x+STAIR_DX*STAIR_STEPS,y:player.y+STAIR_DY*STAIR_STEPS,t:STAIR_STEPS+' MORNINGS'});
+  } else return;
+
+  ctx.save();
+  ctx.setLineDash([6,9]); ctx.lineWidth=1.5; ctx.strokeStyle=hex(K,0.42);
+  ctx.beginPath();
+  for(const e of ends){ ctx.moveTo(px,py); ctx.lineTo(wx(e.x,1),wy(e.y,1)); }
+  ctx.stroke();
+  // every mixture of the two lands somewhere on the line between their extremes
+  // — when there are two. The routine offers exactly one, and always has.
+  if(ends.length>1){
+    ctx.strokeStyle=hex(K,0.26);
+    ctx.beginPath();
+    ctx.moveTo(wx(ends[0].x,1),wy(ends[0].y,1)); ctx.lineTo(wx(ends[1].x,1),wy(ends[1].y,1));
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  for(const e of ends){
+    const ex=wx(e.x,1), ey=wy(e.y,1);
+    ctx.fillStyle=hex(K,0.5);
+    ctx.beginPath(); ctx.arc(ex,ey,3.4,0,6.283); ctx.fill();
+    if(e.t){
+      setFont(ctx,400,us(9),MONO,'0.20em'); ctx.textAlign='center';
+      ctx.fillStyle=hex(K,0.44); ctx.fillText(e.t,ex,ey-us(12)); clearSpace(ctx);
+    }
+  }
+  ctx.restore();
+}
+
+/* ------------------------------------------------------------ armor wheel */
+function drawWheel(){
+  // pulled in on a narrow screen so the labels stay inside the frame
+  const cx=VIEW_W/2, cy=VIEW_H/2, R=Math.min(us(L.shore?152:132),VIEW_W*0.30);
+  ctx.fillStyle='rgba(0,0,0,0.45)'; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  const a=smooth(clamp(S.wheelT/0.18,0,1));
+
+  // Existential Pressure Gauge — the ring at the centre of every choice
+  ctx.save(); ctx.globalAlpha=a;
+  ctx.lineWidth=2; ctx.strokeStyle='rgba(255,255,255,0.14)';
+  ctx.beginPath(); ctx.arc(cx,cy,us(44),0,6.283); ctx.stroke();
+  // the part of it that no longer comes off, whatever you do
+  if(S.floor>0.02){
+    ctx.lineWidth=3.4; ctx.strokeStyle=hex('#FF6B6B',0.30);
+    ctx.beginPath(); ctx.arc(cx,cy,us(44),-Math.PI/2,-Math.PI/2+6.283*S.floor); ctx.stroke();
+  }
+  ctx.lineWidth=3.4; ctx.strokeStyle=hex(S.dread>0.75?'#FF6B6B':'#FFFFFF',0.68);
+  ctx.beginPath(); ctx.arc(cx,cy,us(44),-Math.PI/2,-Math.PI/2+6.283*S.dread); ctx.stroke();
+  setFont(ctx,400,us(9),MONO,'0.22em'); ctx.textAlign='center';
+  ctx.fillStyle='rgba(255,255,255,0.34)'; ctx.fillText('PRESSURE',cx,cy+us(3));
+  ctx.fillStyle='rgba(255,255,255,0.55)'; setFont(ctx,400,us(12),MONO,'0.14em');
+  ctx.fillText(Math.round(S.dread*100)+'%',cx,cy+us(20));
+  clearSpace(ctx);
+
+  drawReach(S.wheelSel);
+
+  const DIRV={up:[0,-1],down:[0,1],left:[-1,0],right:[1,0]};
+  const slots=[];
+  const used=new Set();
+  L.armors.forEach(k=>{ const d=DIRV[WHEEL_SLOTS[k]]; slots.push({k,dx:d[0],dy:d[1]}); used.add(WHEEL_SLOTS[k]); });
+  // the armours this level does not offer sit greyed out in the empty slots
+  ['up','right','down','left'].forEach(dirn=>{
+    if(used.has(dirn)) return;
+    const ghost=Object.keys(ARMORS).find(k=>WHEEL_SLOTS[k]===dirn&&!L.armors.includes(k));
+    if(ghost){ const d=DIRV[dirn]; slots.push({k:ghost,dx:d[0],dy:d[1]}); }
+  });
+  // The shore: all six projects of meaning, all of them already spent. Four
+  // slots cannot say that, so the wheel opens all the way round.
+  if(L.shore){
+    slots.length=0;
+    Object.keys(ARMORS).forEach((k,i)=>{
+      const ang=-Math.PI/2+i/6*6.283;
+      slots.push({k,dx:Math.cos(ang),dy:Math.sin(ang)});
+    });
+  }
+  for(const s of slots){
+    const A=ARMORS[s.k], unlocked=S.unlocked.has(s.k), sel=S.wheelSel===s.k&&unlocked;
+    const x=cx+s.dx*R, y=cy+s.dy*R;
+    ctx.globalAlpha=a*(unlocked?1:0.30);
+    ctx.lineWidth=1; ctx.strokeStyle=hex('#FFFFFF',0.14);
+    ctx.beginPath(); ctx.moveTo(cx+s.dx*us(52),cy+s.dy*us(52)); ctx.lineTo(x-s.dx*us(34),y-s.dy*us(34)); ctx.stroke();
+
+    const box=us(34+(sel?6:0));
+    ctx.save();
+    if(sel){ ctx.shadowColor=hex(A.key,0.9); ctx.shadowBlur=22; }
+    ctx.lineWidth=sel?2.2:1.4;
+    ctx.strokeStyle=hex(unlocked?(sel?A.key:'#FFFFFF'):'#FFFFFF',sel?1:0.42);
+    ctx.fillStyle=hex(A.key,sel?0.16:0.0);
+    ctx.beginPath();
+    if(ctx.roundRect) ctx.roundRect(x-box/2,y-box/2,box,box,us(4)); else ctx.rect(x-box/2,y-box/2,box,box);
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle=hex(unlocked?(sel?A.key:'#FFFFFF'):'#FFFFFF',unlocked?0.9:0.4);
+    setFont(ctx,400,us(17),SANS,'0px'); ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText(A.glyph,x,y+1); ctx.textBaseline='alphabetic';
+    // struck through: this one has already been tried, and it broke
+    if(L.shore){
+      ctx.strokeStyle=hex('#FFFFFF',0.34); ctx.lineWidth=1.2;
+      ctx.beginPath(); ctx.moveTo(x-box/2,y+box/2); ctx.lineTo(x+box/2,y-box/2); ctx.stroke();
+    }
+
+    setFont(ctx,300,us(11),SANS,'0.24em');
+    ctx.fillStyle=hex('#FFFFFF',sel?0.85:0.42);
+    const ly=y+s.dy*us(40)+us(s.dy>0?18:s.dy<0?-24:-30);
+    ctx.fillText(unlocked?A.name:(L.shore?'EXHAUSTED':'LOCKED'),x,ly);
+    if(unlocked&&sel){
+      setFont(ctx,400,us(9),MONO,'0.18em'); ctx.fillStyle=hex(A.key,0.6);
+      ctx.fillText(A.theme,x,ly+us(16));
+    }
+    clearSpace(ctx);
+  }
+  ctx.globalAlpha=a*0.5;
+  setFont(ctx,300,us(12),SANS,'0.30em'); ctx.textAlign='center'; ctx.fillStyle='rgba(255,255,255,0.5)';
+  ctx.fillText(L.shore?'THERE IS NOTHING LEFT TO EQUIP'
+    :(IS_TOUCH?'DRAG TO AN ARMOR · RELEASE TO EQUIP':'AIM WITH MOUSE OR ARROWS · RELEASE TO EQUIP'),cx,VIEW_H-us(54));
+  clearSpace(ctx);
+  ctx.restore();
+}
+
+/* ---------------------------------------------------------- text overlays */
+function drawPromptLayer(){
+  if(!activePrompt) return;
+  const a=promptAlpha(activePrompt);
+  if(a<=0.002) return;
+  // out of the way of the hands while an armour is on
+  const y=(S.mode==='armored')?VIEW_H*0.145:VIEW_H*0.775;
+  ctx.textAlign='center';
+  const size=clamp(VIEW_W*0.021,us(17),us(27));
+  setFont(ctx,200,size,SANS,'0.10em');
+  ctx.fillStyle=hex(activePrompt.tint,a);
+  ctx.shadowColor='rgba(0,0,0,0.7)'; ctx.shadowBlur=18;
+  wrapText(activePrompt.text,VIEW_W/2,y,VIEW_W*0.78,size*1.55);
+  ctx.shadowBlur=0; clearSpace(ctx);
+}
+function wrapText(text,x,y,maxW,lh){
+  const words=text.split(' '); const lines=[]; let line='';
+  for(const w of words){
+    const test=line?line+' '+w:w;
+    if(ctx.measureText(test).width>maxW&&line){ lines.push(line); line=w; } else line=test;
+  }
+  lines.push(line);
+  const y0=y-(lines.length-1)*lh/2;
+  lines.forEach((l,i)=>ctx.fillText(l,x,y0+i*lh));
+}
+
+/* The question the shore asks, and the words it closes on. */
+function drawShoreUI(){
+  if(S.act==='ask'||S.act==='nihil'){
+    const a=S.act==='ask'?smooth(clamp(S.actT/1.3,0,1)):clamp(1-S.actT/0.7,0,1);
+    if(a>0.01){
+      ctx.textAlign='center';
+      setFont(ctx,200,clamp(VIEW_W*0.026,us(21),us(34)),SANS,'0.12em');
+      ctx.shadowColor='rgba(0,0,0,0.85)'; ctx.shadowBlur=24;
+      ctx.fillStyle=hex('#F2F7FF',a*0.90);
+      // above the wall, so the wall can go on showing you what it is showing you
+      ctx.fillText('"Was it all meaningless?"',VIEW_W/2,VIEW_H*0.125);
+      ctx.shadowBlur=0; clearSpace(ctx);
+      for(const b of choiceBoxes()){
+        const sel=S.choiceSel===b.key;
+        ctx.globalAlpha=a;
+        ctx.lineWidth=1.4; ctx.strokeStyle=hex('#F2F7FF',sel?0.92:0.32);
+        ctx.fillStyle=hex('#F2F7FF',sel?0.13:0.03);
+        ctx.beginPath();
+        if(ctx.roundRect) ctx.roundRect(b.x,b.y-b.h/2,b.w,b.h,us(3)); else ctx.rect(b.x,b.y-b.h/2,b.w,b.h);
+        ctx.fill(); ctx.stroke();
+        setFont(ctx,300,us(15),SANS,'0.42em');
+        ctx.fillStyle=hex('#F2F7FF',sel?0.95:0.66);
+        ctx.fillText(b.label,b.x+b.w/2+us(7),b.y+us(5));
+        clearSpace(ctx);
+        ctx.globalAlpha=1;
+      }
+    }
+  }
+  // the epilogue, line by line, over a shore that keeps widening
+  if(S.act==='epilogue'&&S.epiI>=0&&S.epiI<EPILOGUE.length){
+    const t=S.epiT;
+    const a=smooth(inv(0,1.8,t))*(1-smooth(inv(EPI_LINE-1.6,EPI_LINE,t)));
+    if(a>0.01){
+      const size=clamp(VIEW_W*0.020,us(18),us(29));
+      ctx.textAlign='center';
+      setFont(ctx,200,size,SANS,'0.12em');
+      ctx.shadowColor='rgba(0,0,0,0.75)'; ctx.shadowBlur=20;
+      ctx.fillStyle=hex('#F2F7FF',a*0.88);
+      EPILOGUE[S.epiI].split('\n').forEach((l,i)=>ctx.fillText(l,VIEW_W/2,VIEW_H*0.28+i*size*1.7));
+      ctx.shadowBlur=0; clearSpace(ctx);
+    }
+  }
+  if(S.act==='over'){
+    const a=smooth(clamp(S.actT/2.4,0,1));
+    ctx.textAlign='center';
+    setFont(ctx,100,clamp(VIEW_W*0.030,us(24),us(40)),SANS,'0.52em');
+    ctx.fillStyle=hex('#F8FAFC',a*0.92);
+    ctx.fillText('— LUCID —',VIEW_W/2+us(10),VIEW_H*0.29);
+    clearSpace(ctx);
+  }
+}
+
+function drawIntroLabel(){
+  const el=INTRO_DUR-S.intro;
+  const a=smooth(inv(0.4,1.5,el))*(1-smooth(inv(INTRO_HOLD-0.2,INTRO_HOLD+1.0,el)));
+  ctx.textAlign='center';
+  if(a>0.01){
+    const px=wx(L.goalX,1), py=wy(terrainYSafe(L.goalX),1);
+    setFont(ctx,400,us(11),MONO,'0.32em');
+    ctx.fillStyle=hex('#F8FAFC',a*0.62);
+    ctx.fillText(L.goalLabel,px,py+us(40));
+    ctx.strokeStyle=hex('#F8FAFC',a*0.22); ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(px-us(46),py+us(52)); ctx.lineTo(px+us(46),py+us(52)); ctx.stroke();
+    clearSpace(ctx);
+  }
+  const ta=smooth(inv(0.2,1.2,el))*(1-smooth(inv(INTRO_DUR-1.3,INTRO_DUR,el)));
+  if(ta>0.01){
+    setFont(ctx,200,us(15),SANS,'0.40em');
+    ctx.fillStyle=hex('#F8FAFC',ta*0.38);
+    ctx.fillText('LEVEL '+L.id+' — '+L.name,VIEW_W/2,VIEW_H*0.90);
+    clearSpace(ctx);
+  }
+}
+
+function drawHints(){
+  if(S.hintA<0.02||!S.hint) return;
+  ctx.textAlign='center';
+  setFont(ctx,300,us(12),SANS,'0.30em');
+  ctx.fillStyle=hex('#FFFFFF',S.hintA*0.38);
+  ctx.fillText(S.hint.toUpperCase(),VIEW_W/2,VIEW_H-us(44));
+  clearSpace(ctx);
+}
+
+function drawCorner(){
+  ctx.textAlign='left';
+  setFont(ctx,400,us(10),MONO,'0.18em');
+  ctx.fillStyle='rgba(255,255,255,0.18)';
+  ctx.fillText(AU.on?'♪ ON  ·  M':'♪ OFF ·  M',us(22),VIEW_H-us(22));
+  if(!IS_TOUCH){ ctx.textAlign='right'; ctx.fillText('H · CONTROLS',VIEW_W-us(22),VIEW_H-us(22)); }
+  clearSpace(ctx);
+  if(S.showHelp){
+    const lines=(S.opening==='ladder')?(IS_TOUCH?[
+      'DRAG — move',
+      'TAP — jump',
+      'M — mute      H — this list'
+    ]:[
+      'DRAG / ← → — move',
+      'SPACE / ↑ — jump',
+      'M — mute      H — this list'
+    ]):IS_TOUCH?[
+      'DRAG — move (heavy, unarmored)',
+      'TWO THUMBS HELD — open the Armor Wheel',
+      'TAP NODE — advance (armored)',
+      'DOUBLE-TAP — shatter the armor'
+    ]:[
+      'DRAG / ← → — move (heavy, unarmored)',
+      'HOLD SPACE or RIGHT-CLICK — Armor Wheel',
+      'CLICK NODE / → — advance (armored)',
+      'DOUBLE-CLICK or ESC — shatter the armor',
+      'M — mute      H — this list'
+    ];
+    const w=us(430),h=us(lines.length*22+34), x=VIEW_W-w-us(22), y=VIEW_H-h-us(44);
+    ctx.fillStyle='rgba(0,0,0,0.66)'; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=1; ctx.strokeRect(x,y,w,h);
+    ctx.textAlign='left'; setFont(ctx,400,us(11),MONO,'0.10em');
+    ctx.fillStyle='rgba(255,255,255,0.55)';
+    lines.forEach((l,i)=>ctx.fillText(l,x+us(18),y+us(30+i*22)));
+    clearSpace(ctx);
+  }
+}
+
+function drawTitle(){
+  ctx.fillStyle='#04070d'; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  const t=S.wall;
+  for(const s of stars){
+    const tw=0.5+0.5*Math.sin(t*1.2+s.tw);
+    ctx.fillStyle=hex('#F4F1DE',0.5*tw*0.6);
+    ctx.beginPath(); ctx.arc(s.x%VIEW_W,s.y*1.4%VIEW_H,s.r,0,6.283); ctx.fill();
+  }
+  ctx.textAlign='center';
+  const a=smooth(clamp(t/2.2,0,1));
+  setFont(ctx,100,clamp(VIEW_W*0.085,us(54),us(120)),SANS,'0.42em');
+  ctx.fillStyle=hex('#F8FAFC',a*0.92);
+  ctx.fillText('LUCID',VIEW_W/2+VIEW_W*0.021,VIEW_H*0.40);
+  setFont(ctx,200,clamp(VIEW_W*0.016,us(13),us(19)),SANS,'0.16em');
+  ctx.fillStyle=hex('#F8FAFC',a*0.42);
+  ctx.fillText('The illusion gave you safety. The truth gives you the world.',VIEW_W/2,VIEW_H*0.40+us(52));
+  setFont(ctx,400,us(11),MONO,'0.26em');
+  ctx.fillStyle=hex('#38BDF8',a*0.45);
+  // and it names what you are about to be inside, not where you turn out to be
+  ctx.fillText(LEVELS[0].coldOpen&&!S.openDone?'PROJECT 01 — THE CLIMB':'LEVEL 1 — THE RIDGE',
+               VIEW_W/2,VIEW_H*0.40+us(92));
+  const pulse=0.30+0.30*Math.sin(t*2);
+  setFont(ctx,300,us(12),SANS,'0.34em');
+  ctx.fillStyle=hex('#FFFFFF',a*pulse);
+  ctx.fillText(IS_TOUCH?'TAP TO BEGIN':'CLICK OR PRESS ANY KEY TO BEGIN',VIEW_W/2,VIEW_H*0.78);
+  clearSpace(ctx);
+}
+
+/* Between levels: name what just ended, and what is next. */
+function drawInterstitial(){
+  ctx.fillStyle=L.paint.night; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  const t=S.interT, a=smooth(clamp(t/1.4,0,1))*(1-smooth(inv(4.6,5.6,t)));
+  ctx.textAlign='center';
+  setFont(ctx,400,us(11),MONO,'0.30em');
+  ctx.fillStyle=hex('#38BDF8',a*0.5);
+  ctx.fillText('LEVEL '+L.id+' — '+L.name,VIEW_W/2,VIEW_H*0.40);
+  setFont(ctx,100,clamp(VIEW_W*0.045,us(30),us(58)),SANS,'0.34em');
+  ctx.fillStyle=hex('#F8FAFC',a*0.9);
+  ctx.fillText('COMPLETE',VIEW_W/2+VIEW_W*0.015,VIEW_H*0.50);
+  if(L.proto){
+    setFont(ctx,400,us(11),MONO,'0.22em');
+    ctx.fillStyle=hex('#F8FAFC',a*0.40);
+    ctx.fillText(`CROSSED ON ${S.worn} ILLUSION${S.worn===1?'':'S'}`
+      +(S.broken?`  ·  ${S.broken} BROKE UNDER YOU`:'  ·  NONE BROKE'),VIEW_W/2,VIEW_H*0.565);
+    clearSpace(ctx);
+  }
+  const nxt=LEVELS[S.levelIdx+1];
+  if(nxt){
+    setFont(ctx,200,clamp(VIEW_W*0.014,us(12),us(17)),SANS,'0.18em');
+    ctx.fillStyle=hex('#F8FAFC',a*0.42);
+    ctx.fillText('NEXT — LEVEL '+nxt.id+': '+nxt.name,VIEW_W/2,VIEW_H*0.62);
+  }
+  const pulse=0.28+0.30*Math.sin(t*2);
+  setFont(ctx,300,us(12),SANS,'0.34em');
+  ctx.fillStyle=hex('#FFFFFF',a*pulse);
+  ctx.fillText(IS_TOUCH?'TAP TO CONTINUE':'PRESS ANY KEY TO CONTINUE',VIEW_W/2,VIEW_H*0.80);
+  clearSpace(ctx);
+}
+
+/* After the shore. The quiet that the whole game was walking towards, with
+   the drone still holding the chord it finally resolved to. */
+function drawComplete(){
+  ctx.fillStyle='#04070d'; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  const t=S.doneT||0;
+  for(const s of stars){
+    const tw=0.5+0.5*Math.sin(t*1.1+s.tw);
+    const px=(((s.x*1.7)%VIEW_W)+VIEW_W)%VIEW_W, py=(((s.y*3.1)%VIEW_H)+VIEW_H)%VIEW_H;
+    ctx.fillStyle=hex('#F2F7FF',0.30*tw);
+    ctx.beginPath(); ctx.arc(px,py,us(s.r*0.95),0,6.283); ctx.fill();
+  }
+  ctx.textAlign='center';
+  const a=smooth(clamp(t/3.0,0,1));
+  setFont(ctx,100,clamp(VIEW_W*0.06,us(38),us(76)),SANS,'0.44em');
+  ctx.fillStyle=hex('#F8FAFC',a*0.92);
+  ctx.fillText('LUCID',VIEW_W/2+VIEW_W*0.024,VIEW_H*0.42);
+  const a2=smooth(clamp((t-2.2)/2.6,0,1));
+  setFont(ctx,200,clamp(VIEW_W*0.016,us(13),us(19)),SANS,'0.12em');
+  ctx.fillStyle=hex('#F8FAFC',a2*0.50);
+  ctx.fillText('The illusion gave you safety. The truth gives you the world.',VIEW_W/2,VIEW_H*0.42+us(54));
+  const a3=smooth(clamp((t-5.2)/2.6,0,1));
+  setFont(ctx,400,us(10),MONO,'0.26em');
+  ctx.fillStyle=hex('#38BDF8',a3*0.42);
+  ctx.fillText('AFTER ERNEST BECKER · THE DENIAL OF DEATH',VIEW_W/2,VIEW_H*0.63);
+  ctx.fillStyle=hex('#FFFFFF',a3*0.20);
+  ctx.fillText('RELOAD TO WALK THE RIDGE AGAIN',VIEW_W/2,VIEW_H*0.70);
+  clearSpace(ctx);
+}
+
+/* ---------------------------------------------------------------- frame -- */
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.setTransform(SCALE,0,0,SCALE,0,0);
+
+  if(S.screen==='title'){ drawTitle(); return; }
+  if(S.screen==='interstitial'){ drawInterstitial(); return; }
+  if(S.screen==='complete'){ drawComplete(); return; }
+
+  if(S.tear){
+    drawTear(S.tear); drawCorner();
+    if(S.fade>0.002){ ctx.fillStyle=hex('#000000',S.fade); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+    return;
+  }
+
+  if(S.transition){
+    if(S.transition.type==='equip') drawEquip(S.transition);
+    else drawShatter(S.transition);
+  } else if(S.mode==='lucid'){
+    drawRaw(L.shore?{dark:S.dim}:{});
+  } else {
+    drawArmored(ctx,S.armor,1,1);
+  }
+
+  if(S.wheelOpen){ S.wheelT+=S.dt; drawWheel(); }
+  drawPromptLayer();
+  if(L.shore) drawShoreUI();
+  if(S.intro>0) drawIntroLabel();
+  if(!S.wheelOpen&&S.intro<=0) drawHints();
+  drawCorner();
+
+  // collapse: the screen holds still while you cannot. The wheel, if you have
+  // reached for it, owns the middle of the screen instead.
+  if(S.collapsed>0&&!S.wheelOpen){
+    ctx.textAlign='center'; setFont(ctx,300,us(12),SANS,'0.34em');
+    ctx.fillStyle=hex('#FFFFFF',0.30+0.16*Math.sin(S.t*3));
+    ctx.fillText('YOU CANNOT MOVE',VIEW_W/2,VIEW_H*0.5);
+    // you can still reach for something. That is the whole of the game.
+    setFont(ctx,300,us(11),SANS,'0.30em');
+    ctx.fillStyle=hex('#FFFFFF',0.34+0.2*Math.sin(S.t*3));
+    ctx.fillText(IS_TOUCH?'HOLD TWO THUMBS':'HOLD SPACE',VIEW_W/2,VIEW_H*0.5+us(30));
+    clearSpace(ctx);
+  }
+  if(S.fade>0.002){ ctx.fillStyle=hex('#000000',S.fade); ctx.fillRect(0,0,VIEW_W,VIEW_H); }
+  const cls=(S.mode==='lucid'?'lucid ':'')+(ptr.down?'dragging':'');
+  if(cls!==document.body.className) document.body.className=cls;   // avoid a style recalc every frame
+}
+
+/* ------------------------------------------------------------------ loop - */
+loadLevel(0);
+S.intro=0;                       // the title screen holds until the player begins
+
+let last=performance.now();
+function frame(now){
+  let dt=(now-last)/1000; last=now;
+  dt=Math.min(dt,1/20);
+  S.dt=dt;
+  // A throw in here used to end the game: the next frame was only ever asked
+  // for after both of these returned, so one bad frame meant a dead picture and
+  // a player holding keys at it. A bad frame is now just a bad frame.
+  try{ update(dt); draw(); }
+  catch(e){ if(!frame.told){ frame.told=1; console.error('frame',e); } }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

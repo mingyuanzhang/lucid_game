@@ -1202,6 +1202,14 @@ cv.addEventListener('contextmenu',e=>e.preventDefault());
 window.addEventListener('keydown',e=>{
   if(e.repeat){ return; }
   const k=e.key.toLowerCase();
+  // developer keys first -- the title screen and the intro both swallow
+  // whatever they are given, and these have to work from either
+  if(k==='`'||k==='~'){ DEV.on=!DEV.on; e.preventDefault(); return; }
+  if(DEV.on&&k>='0'&&k<='4'&&!e.metaKey&&!e.ctrlKey&&!e.altKey){
+    e.preventDefault();
+    devJump(k==='0'?0:(+k-1), k==='0');
+    return;
+  }
   if(S.screen==='title'){ beginPlay(); e.preventDefault(); return; }
   if(S.screen==='interstitial'){ if(S.interT>1.2) nextLevel(); e.preventDefault(); return; }
   keys.add(k);
@@ -1433,6 +1441,49 @@ function loadLevel(i){
 function nextLevel(){
   if(S.levelIdx<LEVELS.length-1){ loadLevel(S.levelIdx+1); S.screen='play'; }
   else S.screen='complete';
+}
+
+/* ========================================================== DEVELOPER ==== */
+/* Not for the player, and deliberately not discoverable by one: the shore is
+   twenty minutes downstream of the ridge, and nobody should have to walk it to
+   look at a two-second bug. Backquote toggles it; 1-4 stand you in a level;
+   0 replays the opening ladder. ?dev / ?level=3 do the same from the URL. */
+const DEV={on:false};
+function devJump(i,ladder,quiet){
+  if(!quiet) audioStart();
+  S.screen='play';
+  loadLevel(clamp(i,0,LEVELS.length-1));
+  if(S.levelIdx===0&&!ladder){
+    // loadLevel drops you into the cold open; step out of it onto the ridge,
+    // which is where the level proper actually begins
+    clearArmorState();
+    S.opening=''; S.openDone=true; S.openTry=0; S.tear=null; S.revealT=0;
+    S.mode='lucid'; S.armor=null; S.transition=null;
+    S.falling=false; S.fallV=0; S.collapsed=0; S.pendingCollapse=false;
+    S.dread=0.22; S.floor=FLOOR_BASE; S.grace=1.5; S.worn=0; S.broken=0;
+    // and standing where the reveal would have set you down, not at the spawn
+    const rx=L.coldOpen?L.coldOpen.x:L.spawn;
+    player.x=rx; player.y=terrainYSafe(rx); player.vx=0; player.vy=0;
+    player.safe=rx; player.kneel=0; player.tremor=0.6;
+    zoom=ZOOM_LUCID; applyZoom(); camTarget(); cam.x=cam.tx; cam.y=cam.ty;
+  }
+  S.intro=0;
+  // every project this level offers, on the wheel at once: the second one is
+  // normally earned by enduring, and enduring is the part you are skipping
+  L.armors.forEach(a=>S.unlocked.add(a));
+  if(!(S.levelIdx===0&&ladder)) say(['start','city','vault','shore'][S.levelIdx]);
+}
+/* A line that says the game is not being played honestly right now. */
+function drawDev(){
+  if(!DEV.on) return;
+  ctx.save();
+  ctx.textAlign='left';
+  setFont(ctx,400,us(9),MONO,'0.22em');
+  ctx.fillStyle=hex('#7CE7C0',0.5);
+  const where=(S.screen==='play')?('L'+(S.levelIdx+1)+' '+L.name+'  \u00b7  '):'';
+  ctx.fillText('DEV  \u00b7  '+where+'1-4 LEVEL  \u00b7  0 LADDER  \u00b7  ` OFF',us(22),us(26));
+  clearSpace(ctx);
+  ctx.restore();
 }
 
 /* Everything a project of meaning left behind, swept up. */
@@ -3947,6 +3998,7 @@ function drawCorner(){
   ctx.fillText(AU.on?'♪ ON  ·  M':'♪ OFF ·  M',us(22),VIEW_H-us(22));
   if(!IS_TOUCH){ ctx.textAlign='right'; ctx.fillText('H · CONTROLS',VIEW_W-us(22),VIEW_H-us(22)); }
   clearSpace(ctx);
+  drawDev();
   if(S.showHelp){
     const lines=(S.opening==='ladder')?(IS_TOUCH?[
       'DRAG — move',
@@ -4072,9 +4124,9 @@ function draw(){
   ctx.clearRect(0,0,cv.width,cv.height);
   ctx.setTransform(SCALE,0,0,SCALE,0,0);
 
-  if(S.screen==='title'){ drawTitle(); return; }
-  if(S.screen==='interstitial'){ drawInterstitial(); return; }
-  if(S.screen==='complete'){ drawComplete(); return; }
+  if(S.screen==='title'){ drawTitle(); drawDev(); return; }
+  if(S.screen==='interstitial'){ drawInterstitial(); drawDev(); return; }
+  if(S.screen==='complete'){ drawComplete(); drawDev(); return; }
 
   if(S.tear){
     drawTear(S.tear); drawCorner();
@@ -4118,6 +4170,20 @@ function draw(){
 /* ------------------------------------------------------------------ loop - */
 loadLevel(0);
 S.intro=0;                       // the title screen holds until the player begins
+
+/* ?dev (or #dev) arms the developer keys; ?level=3 arms them and starts there.
+   ?level=1&ladder keeps the opening rather than skipping it. */
+(function(){
+  const q=new URLSearchParams(location.search),
+        h=new URLSearchParams(location.hash.replace(/^#/,''));
+  const get=k=>{ const v=q.get(k); return v!==null?v:h.get(k); };
+  if(get('dev')!==null||get('level')!==null) DEV.on=true;
+  const lv=get('level');
+  if(lv){
+    const n=parseInt(lv,10);
+    if(n>=1&&n<=LEVELS.length) devJump(n-1,get('ladder')!==null,true);
+  }
+})();
 
 let last=performance.now();
 function frame(now){
